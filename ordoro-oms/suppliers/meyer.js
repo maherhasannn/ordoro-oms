@@ -1,0 +1,179 @@
+import axios from "axios";
+import SftpClient from "ssh2-sftp-client";
+import { parse } from "csv-parse/sync";
+import { upsertMeyerInventory, getMeyerInventory } from "../db.js";
+import { withTimeout } from "../lib/timeout.js";
+
+const BASE =
+  process.env.MEYER_API_URL ||
+  "https://meyerapi.meyerdistributing.com/http/default/ProdAPI/v2";
+const MEYER_FEED_TIMEOUT = 60_000;
+const MEYER_API_TIMEOUT = 10_000;
+
+function authHeaders() {
+  return { Authorization: `Espresso ${process.env.MEYER_API_KEY}:1` };
+}
+
+// ── SFTP Feed Sync ──────────────────────────────────────
+// Meyer pushes two CSV files to our SFTP server:
+//   inventory_feed.csv — columns: MFGName, MFG Item Number, Item Number, Available, ...
+//   pricing_feed.csv   — columns: MFG, MFG Item Number, Meyer Part, Description, Jobber Price, Your Price, ...
+// We merge them on Item Number / Meyer Part and cache to Supabase.
+
+export async function syncFeed() {
+  const host = process.env.MEYER_SFTP_HOST;
+  const port = Number(process.env.MEYER_SFTP_PORT) || 22;
+  const user = process.env.MEYER_SFTP_USER;
+  const pass = process.env.MEYER_SFTP_PASS;
+  const dir = process.env.MEYER_SFTP_DIR || "/inbound/inventory";
+
+  if (!host || !user) {
+    console.log("[meyer] SFTP not configured — skipping feed sync");
+    return;
+  }
+
+  const sftp = new SftpClient();
+  let invContent;
+  let priceContent;
+
+  try {
+    await withTimeout(
+      (async () => {
+        console.log(`[meyer] Connecting to SFTP ${host}:${port}...`);
+        await sftp.connect({ host, port, username: user, password: pass });
+
+        // ── Download inventory feed ──────────────────────────
+        console.log("[meyer] Downloading inventory_feed.csv...");
+        const invBuf = await sftp.get(`${dir}/inventory_feed.csv`);
+        invContent = invBuf.toString("utf-8");
+        console.log(`[meyer] Inventory feed: ${(invContent.length / 1024 / 1024).toFixed(1)} MB`);
+
+        // ── Download pricing feed ────────────────────────────
+        console.log("[meyer] Downloading pricing_feed.csv...");
+        const priceBuf = await sftp.get(`${dir}/pricing_feed.csv`);
+        priceContent = priceBuf.toString("utf-8");
+        console.log(`[meyer] Pricing feed: ${(priceContent.length / 1024 / 1024).toFixed(1)} MB`);
+
+        await sftp.end();
+      })(),
+      MEYER_FEED_TIMEOUT,
+      "meyer SFTP feed download"
+    );
+  } catch (err) {
+    console.error(`[meyer] SFTP feed sync failed: ${err.message}`);
+    try { await sftp.end(); } catch (_) {}
+    throw err;
+  }
+
+  // CSV parsing stays outside timeout (local I/O, fast)
+  const invRows = parse(invContent, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+    relax_column_count: true,
+    relax_quotes: true,
+  });
+  console.log(`[meyer] Parsed ${invRows.length} inventory rows`);
+
+  // Build inventory map: Item Number → { stock, stocking, mfr_part_number }
+  const invMap = new Map();
+  for (const r of invRows) {
+    const sku = r["Item Number"];
+    if (!sku) continue;
+    invMap.set(sku, {
+      stock: Math.floor(Number(r["Available"]) || 0),
+      stocking: r["Stocking"] === "Yes",
+      mfr_part_number: r["MFG Item Number"] || null,
+    });
+  }
+
+  const priceRows = parse(priceContent, {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+    relax_column_count: true,
+    relax_quotes: true,
+  });
+  console.log(`[meyer] Parsed ${priceRows.length} pricing rows`);
+
+  // ── Merge inventory + pricing ────────────────────────
+  const merged = [];
+  for (const p of priceRows) {
+    const sku = p["Meyer Part"];
+    if (!sku) continue;
+
+    const inv = invMap.get(sku);
+    const mfrPart = inv?.mfr_part_number || p["MFG Item Number"] || null;
+
+    merged.push({
+      meyer_sku: sku,
+      mfr_part_number: mfrPart,
+      product_name: p["Description"] || null,
+      stock: inv ? inv.stock : 0,
+      cost: Number(p["Your Price"]) || 0,
+      list_price: Number(p["Jobber Price"]) || 0,
+    });
+  }
+
+  console.log(`[meyer] Merged ${merged.length} items (${invMap.size} had inventory data)`);
+
+  // ── Upsert to Supabase ───────────────────────────────
+  console.log(`[meyer] Upserting ${merged.length} items to Supabase...`);
+  await upsertMeyerInventory(merged);
+  console.log(`[meyer] Feed sync complete — ${merged.length} items cached`);
+}
+
+// ── REST API: Item Information (live check) ─────────────
+
+export async function getItemInfo(itemNumber, customerNumber) {
+  const custNum = customerNumber || process.env.MEYER_CUSTOMER_NUMBER;
+  const res = await withTimeout(
+    axios.get(`${BASE}/ItemInformation`, {
+      headers: authHeaders(),
+      params: { CustomerNumber: custNum, ItemNumber: itemNumber },
+    }),
+    MEYER_API_TIMEOUT,
+    `meyer GET ItemInformation ${itemNumber}`
+  );
+  const items = Array.isArray(res.data) ? res.data : [];
+  return items[0] || null;
+}
+
+// ── Check single SKU (uses cached SFTP data, falls back to REST API) ──
+
+export async function check(sku) {
+  // try cached SFTP data first (faster, no API call)
+  const cached = await getMeyerInventory(sku);
+  if (cached) {
+    return {
+      supplier: "meyer",
+      stock: cached.stock,
+      cost: Number(cached.cost) || 0,
+    };
+  }
+
+  // fall back to REST API directly (not via liveCheck which returns structured status)
+  const item = await getItemInfo(sku);
+  if (!item) return { supplier: "meyer", stock: 0, cost: 0 };
+  return {
+    supplier: "meyer",
+    stock: Number(item.QtyAvailable ?? 0),
+    cost: Number(item.CustomerPrice ?? 0),
+  };
+}
+
+// ── Live check (always hits REST API, bypasses cache) ──
+
+export async function liveCheck(sku) {
+  try {
+    const item = await getItemInfo(sku);
+    if (!item) return { status: "ok", stock: 0, cost: 0 };
+    return {
+      status: "ok",
+      stock: Number(item.QtyAvailable ?? 0),
+      cost: Number(item.CustomerPrice ?? 0),
+    };
+  } catch (err) {
+    return { status: "error", error: err.message };
+  }
+}
