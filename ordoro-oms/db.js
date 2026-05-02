@@ -10,6 +10,8 @@ const supabase = createClient(
 
 export async function upsertOrder(order) {
   const lines = order.lines || [];
+  const tags = (order.tags || []).map((t) => t.text || t);
+  const isDs = tags.includes("Contains DS Items");
 
   // upsert top-level order
   const { error: orderErr } = await supabase.from("orders").upsert(
@@ -51,6 +53,7 @@ export async function upsertOrder(order) {
         quantity: l.quantity || 1,
         unit_price: l.unit_price ?? l.item_price ?? null,
         status: "pending",
+        is_ds: isDs,
       });
       if (lineErr) throw lineErr;
     }
@@ -64,6 +67,7 @@ export async function getUnprocessedLines() {
     .from("order_lines")
     .select("*")
     .eq("status", "pending")
+    .eq("is_ds", true)
     .order("created_at", { ascending: true });
   if (error) throw error;
   return data || [];
@@ -158,6 +162,38 @@ export async function getMeyerInventory(sku) {
     .from("meyer_inventory")
     .select("*")
     .eq("meyer_sku", sku)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+// ── MPN-based Inventory Lookups ─────────────────────────
+
+export async function getTurn14ByMpn(mpn) {
+  const { data, error } = await supabase
+    .from("turn14_inventory")
+    .select("*")
+    .eq("mfr_part_number", mpn)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+export async function getEkeystoneByMpn(mpn) {
+  const { data, error } = await supabase
+    .from("ekeystone_inventory")
+    .select("*")
+    .eq("mfr_part_number", mpn)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+export async function getMeyerByMpn(mpn) {
+  const { data, error } = await supabase
+    .from("meyer_inventory")
+    .select("*")
+    .eq("mfr_part_number", mpn)
     .maybeSingle();
   if (error) throw error;
   return data;

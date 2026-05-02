@@ -30,6 +30,9 @@ create table if not exists order_lines (
   decision_reason  text,
   decided_at       timestamptz,
 
+  -- drop-ship flag (set from "Contains DS Items" tag)
+  is_ds            boolean default false,
+
   -- state machine
   status           text not null default 'pending'
     check (status in ('pending', 'decided', 'ordering', 'ordered', 'failed')),

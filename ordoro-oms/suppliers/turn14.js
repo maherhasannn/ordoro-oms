@@ -1,5 +1,6 @@
 import axios from "axios";
 import { withTimeout } from "../lib/timeout.js";
+import { getTurn14ByMpn } from "../db.js";
 
 const BASE = process.env.TURN14_BASE_URL || "https://api.turn14.com/v1";
 const TURN14_API_TIMEOUT = 10_000;
@@ -84,6 +85,17 @@ export async function check(productId) {
     supplier: "turn14",
     stock: inv.stock,
     cost: price.cost,
+  };
+}
+
+export async function checkByMpn(mpn) {
+  const row = await getTurn14ByMpn(mpn);
+  if (!row) return { supplier: "turn14", stock: 0, cost: 0, supplierId: null };
+  return {
+    supplier: "turn14",
+    stock: row.stock,
+    cost: Number(row.cost) || 0,
+    supplierId: row.product_id,
   };
 }
 

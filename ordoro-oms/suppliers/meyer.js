@@ -1,7 +1,7 @@
 import axios from "axios";
 import SftpClient from "ssh2-sftp-client";
 import { parse } from "csv-parse/sync";
-import { upsertMeyerInventory, getMeyerInventory } from "../db.js";
+import { upsertMeyerInventory, getMeyerInventory, getMeyerByMpn } from "../db.js";
 import { withTimeout } from "../lib/timeout.js";
 
 const BASE =
@@ -159,6 +159,17 @@ export async function check(sku) {
     supplier: "meyer",
     stock: Number(item.QtyAvailable ?? 0),
     cost: Number(item.CustomerPrice ?? 0),
+  };
+}
+
+export async function checkByMpn(mpn) {
+  const row = await getMeyerByMpn(mpn);
+  if (!row) return { supplier: "meyer", stock: 0, cost: 0, supplierId: null };
+  return {
+    supplier: "meyer",
+    stock: row.stock,
+    cost: Number(row.cost) || 0,
+    supplierId: row.meyer_sku,
   };
 }
 

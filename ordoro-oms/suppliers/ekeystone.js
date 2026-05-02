@@ -3,7 +3,7 @@ import { parse } from "csv-parse/sync";
 import { readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { upsertEkeystoneInventory, getEkeystoneInventory } from "../db.js";
+import { upsertEkeystoneInventory, getEkeystoneInventory, getEkeystoneByMpn } from "../db.js";
 import { withTimeout } from "../lib/timeout.js";
 
 const LOCAL_FILE = join(tmpdir(), "ekeystone-feed.csv");
@@ -118,6 +118,17 @@ export async function check(vcpn) {
     supplier: "ekeystone",
     stock: row.stock,
     cost: Number(row.cost),
+  };
+}
+
+export async function checkByMpn(mpn) {
+  const row = await getEkeystoneByMpn(mpn);
+  if (!row) return { supplier: "ekeystone", stock: 0, cost: 0, supplierId: null };
+  return {
+    supplier: "ekeystone",
+    stock: row.stock,
+    cost: Number(row.cost) || 0,
+    supplierId: row.vcpn,
   };
 }
 

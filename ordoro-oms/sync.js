@@ -5,7 +5,6 @@ dotenv.config();
 import {
   upsertOrder,
   getUnprocessedLines,
-  lookupProductMap,
   updateOrderLineDecision,
   getSyncState,
   setSyncState,
@@ -21,7 +20,7 @@ import { alertUnfulfillable } from "./lib/notify.js";
 
 // ── Config ──────────────────────────────────────────────
 
-const POLL_INTERVAL = 15_000; // 15 seconds
+const POLL_INTERVAL = 180_000; // 15 seconds
 const EKEYSTONE_SYNC_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours (feed updates daily)
 const MEYER_SYNC_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours (Meyer pushes periodically)
 const WATERMARK_KEY = "ordoro_last_sync";
@@ -48,33 +47,22 @@ async function fetchOrders(since) {
 
 // ── Supplier Check (isolated try/catch per supplier) ────
 
-async function checkSupplier(name, fn, id) {
-  if (!id) return null;
+async function checkSupplierByMpn(name, fn, mpn) {
   try {
-    return await fn(id);
+    return await fn(mpn);
   } catch (err) {
-    console.error(`  [${name}] error for ${id}: ${err.message}`);
+    console.error(`  [${name}] error for MPN ${mpn}: ${err.message}`);
     return null;
   }
 }
 
 // ── Live Verification ───────────────────────────────────
-// Maps supplier name → { liveCheck fn, supplier ID from product_map }
 
 const LIVE_CHECK_FN = {
   turn14: turn14.liveCheck,
   meyer: meyer.liveCheck,
   ekeystone: ekeystone.liveCheck,
 };
-
-function getSupplierIdFromMap(supplierName, map) {
-  switch (supplierName) {
-    case "turn14": return map.turn14_product_id;
-    case "ekeystone": return map.ekeystone_vcpn;
-    case "meyer": return map.meyer_sku;
-    default: return null;
-  }
-}
 
 // ── Process a single unprocessed line ───────────────────
 
@@ -89,21 +77,11 @@ async function processLine(line) {
   const MIN_STOCK_BUFFER = 4;
   const minStock = Math.max(line.quantity, MIN_STOCK_BUFFER);
 
-  // 1. Look up product map
-  const map = await lookupProductMap(line.mpn);
-  if (!map) {
-    console.log(`  ${tag} — no product mapping, skipping`);
-    await updateOrderLineDecision(line.id, {
-      decision_reason: "no product mapping",
-    });
-    return;
-  }
-
-  // 2. Check all 3 suppliers in parallel
+  // 1. Check all 3 suppliers by MPN in parallel
   const [t14, ekey, mey] = await Promise.all([
-    checkSupplier("turn14", turn14.check, map.turn14_product_id),
-    checkSupplier("ekeystone", ekeystone.check, map.ekeystone_vcpn),
-    checkSupplier("meyer", meyer.check, map.meyer_sku),
+    checkSupplierByMpn("turn14", turn14.checkByMpn, line.mpn),
+    checkSupplierByMpn("ekeystone", ekeystone.checkByMpn, line.mpn),
+    checkSupplierByMpn("meyer", meyer.checkByMpn, line.mpn),
   ]);
 
   const results = [t14, ekey, mey].filter(Boolean);
@@ -129,8 +107,7 @@ async function processLine(line) {
     let verified = false;
     for (const candidate of candidates) {
       const liveCheckFn = LIVE_CHECK_FN[candidate.supplier];
-      const supplierId = getSupplierIdFromMap(candidate.supplier, map);
-      const liveResult = await liveCheckFn(supplierId);
+      const liveResult = await liveCheckFn(candidate.supplierId);
 
       if (liveResult.status === "no_api") {
         // eKeystone: no live API, trust cached data
@@ -216,7 +193,10 @@ async function pollCycle() {
       // upsert to Supabase
       for (const o of orders) {
         await upsertOrder(o);
-        console.log(`  Saved order ${o.order_number}`);
+        const tags = (o.tags || []).map(t => t.text || t);
+        const isDs = tags.includes("Contains DS Items");
+        const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
+        console.log(`  Saved order ${o.order_number} [tags: ${tagStr}]${isDs ? " ★ DS" : " — skipping (no DS tag)"}`);
       }
 
       // advance watermark
@@ -284,23 +264,20 @@ async function main() {
     console.error("[recovery] Error checking stuck lines:", err.message);
   }
 
-  // sync eKeystone FTP feed on startup (non-blocking if creds missing)
-  if (process.env.EKEYSTONE_FTP_HOST) {
-    await syncEkeystone();
-    // re-sync every 12 hours (feed updates daily)
-    setInterval(syncEkeystone, EKEYSTONE_SYNC_INTERVAL);
-  } else {
-    console.log("[ekeystone] FTP not configured — skipping feed sync");
-  }
-
-  // sync Meyer SFTP feed on startup (non-blocking if creds missing)
-  if (process.env.MEYER_SFTP_HOST) {
-    await syncMeyer();
-    // re-sync every 6 hours
-    setInterval(syncMeyer, MEYER_SYNC_INTERVAL);
-  } else {
-    console.log("[meyer] SFTP not configured — skipping feed sync");
-  }
+  // // TEMP: skipping feed syncs for testing — polling only
+  // if (process.env.EKEYSTONE_FTP_HOST) {
+  //   await syncEkeystone();
+  //   setInterval(syncEkeystone, EKEYSTONE_SYNC_INTERVAL);
+  // } else {
+  //   console.log("[ekeystone] FTP not configured — skipping feed sync");
+  // }
+  // if (process.env.MEYER_SFTP_HOST) {
+  //   await syncMeyer();
+  //   setInterval(syncMeyer, MEYER_SYNC_INTERVAL);
+  // } else {
+  //   console.log("[meyer] SFTP not configured — skipping feed sync");
+  // }
+  console.log("[startup] Feed syncs disabled for testing — polling only");
 
   // first poll immediately, then every 15s
   await pollCycle();
