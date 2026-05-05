@@ -7,7 +7,7 @@ import { withTimeout } from "../lib/timeout.js";
 const BASE =
   process.env.MEYER_API_URL ||
   "https://meyerapi.meyerdistributing.com/http/default/ProdAPI/v2";
-const MEYER_FEED_TIMEOUT = 60_000;
+const MEYER_FEED_TIMEOUT = 600_000; // 10 minutes (48+ MB file)
 const MEYER_API_TIMEOUT = 10_000;
 
 function authHeaders() {
@@ -162,14 +162,17 @@ export async function check(sku) {
   };
 }
 
-export async function checkByMpn(mpn) {
-  const row = await getMeyerByMpn(mpn);
-  if (!row) return { supplier: "meyer", stock: 0, cost: 0, supplierId: null };
+export async function checkByMpn(mpn, mappedSku = null) {
+  let row = null;
+  if (mappedSku) row = await getMeyerInventory(mappedSku);
+  if (!row) row = await getMeyerByMpn(mpn);
+  if (!row) return { supplier: "meyer", stock: 0, cost: 0, supplierId: null, cachedAt: null };
   return {
     supplier: "meyer",
     stock: row.stock,
     cost: Number(row.cost) || 0,
     supplierId: row.meyer_sku,
+    cachedAt: row.updated_at || null,
   };
 }
 

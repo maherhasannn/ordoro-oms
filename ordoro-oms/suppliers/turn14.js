@@ -1,6 +1,6 @@
 import axios from "axios";
 import { withTimeout } from "../lib/timeout.js";
-import { getTurn14ByMpn } from "../db.js";
+import { getTurn14ById, getTurn14ByMpn } from "../db.js";
 
 const BASE = process.env.TURN14_BASE_URL || "https://api.turn14.com/v1";
 const TURN14_API_TIMEOUT = 10_000;
@@ -61,18 +61,19 @@ export async function checkInventory(productId) {
   // data.data is an array with one item containing warehouse stock objects
   const inv = data?.data?.[0]?.attributes?.inventory || {};
 
-  // sum all warehouse stocks
+  // sum all warehouse stocks — handle both { stock: N } and plain N shapes
   let total = 0;
-  for (const warehouse of Object.values(inv)) {
-    total += Number(warehouse?.stock ?? 0);
+  for (const wh of Object.values(inv)) {
+    const val = typeof wh === "object" && wh !== null ? wh.stock : wh;
+    total += Number(val ?? 0);
   }
   return { supplier: "turn14", productId, stock: total };
 }
 
 export async function getPrice(productId) {
-  const data = await apiGet(`/items/${productId}`);
-  const pricing = data?.data?.[0]?.attributes?.pricing || {};
-  const cost = Number(pricing.turn14cost ?? 0);
+  const data = await apiGet(`/pricing/${productId}`);
+  const attrs = data?.data?.attributes || {};
+  const cost = Number(attrs.purchase_cost ?? 0);
   return { supplier: "turn14", productId, cost };
 }
 
@@ -88,14 +89,17 @@ export async function check(productId) {
   };
 }
 
-export async function checkByMpn(mpn) {
-  const row = await getTurn14ByMpn(mpn);
-  if (!row) return { supplier: "turn14", stock: 0, cost: 0, supplierId: null };
+export async function checkByMpn(mpn, mappedProductId = null) {
+  let row = null;
+  if (mappedProductId) row = await getTurn14ById(mappedProductId);
+  if (!row) row = await getTurn14ByMpn(mpn);
+  if (!row) return { supplier: "turn14", stock: 0, cost: 0, supplierId: null, cachedAt: null };
   return {
     supplier: "turn14",
     stock: row.stock,
     cost: Number(row.cost) || 0,
     supplierId: row.product_id,
+    cachedAt: row.updated_at || null,
   };
 }
 

@@ -7,7 +7,7 @@ import { upsertEkeystoneInventory, getEkeystoneInventory, getEkeystoneByMpn } fr
 import { withTimeout } from "../lib/timeout.js";
 
 const LOCAL_FILE = join(tmpdir(), "ekeystone-feed.csv");
-const EKEYSTONE_FEED_TIMEOUT = 60_000;
+const EKEYSTONE_FEED_TIMEOUT = 300_000; // 5 minutes
 let lastFeedSync = null;
 
 // ── FTPS download + parse ───────────────────────────────
@@ -121,14 +121,17 @@ export async function check(vcpn) {
   };
 }
 
-export async function checkByMpn(mpn) {
-  const row = await getEkeystoneByMpn(mpn);
-  if (!row) return { supplier: "ekeystone", stock: 0, cost: 0, supplierId: null };
+export async function checkByMpn(mpn, mappedVcpn = null) {
+  let row = null;
+  if (mappedVcpn) row = await getEkeystoneInventory(mappedVcpn);
+  if (!row) row = await getEkeystoneByMpn(mpn);
+  if (!row) return { supplier: "ekeystone", stock: 0, cost: 0, supplierId: null, cachedAt: null };
   return {
     supplier: "ekeystone",
     stock: row.stock,
     cost: Number(row.cost) || 0,
     supplierId: row.vcpn,
+    cachedAt: row.updated_at || null,
   };
 }
 

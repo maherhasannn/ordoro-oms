@@ -46,6 +46,9 @@ async function syncTurn14() {
 
   let totalSynced = 0;
 
+  let authRetries = 0;
+  const MAX_AUTH_RETRIES = 3;
+
   for (let page = 1; page <= totalPages; page++) {
     try {
       // fetch items + inventory for this page in parallel
@@ -62,8 +65,10 @@ async function syncTurn14() {
       for (const inv of invData) {
         const warehouses = inv.attributes?.inventory || {};
         let total = 0;
-        for (const qty of Object.values(warehouses)) {
-          total += Number(qty ?? 0);
+        for (const wh of Object.values(warehouses)) {
+          // handle both shapes: { stock: N } (object) or N (plain number)
+          const val = typeof wh === "object" && wh !== null ? wh.stock : wh;
+          total += Number(val ?? 0);
         }
         invMap[inv.id] = total;
       }
@@ -101,13 +106,17 @@ async function syncTurn14() {
       await sleep(500);
     } catch (err) {
       if (err.response?.status === 401) {
-        // token expired mid-sync, get a new one
-        console.log("[turn14] Token expired, refreshing...");
+        authRetries++;
+        if (authRetries > MAX_AUTH_RETRIES) {
+          throw new Error(`[turn14] Persistent 401 after ${MAX_AUTH_RETRIES} token refreshes — aborting sync`);
+        }
+        console.log(`[turn14] Token expired, refreshing (attempt ${authRetries}/${MAX_AUTH_RETRIES})...`);
         const newToken = await getToken();
         headers.Authorization = `Bearer ${newToken}`;
         page--; // retry this page
         continue;
       }
+      authRetries = 0; // reset on non-401 errors (token is working)
       console.error(`[turn14] Page ${page} error:`, err.message);
       await sleep(2000); // back off on errors
     }
@@ -138,17 +147,106 @@ async function syncMeyer() {
   await meyer.syncFeed();
 }
 
+// ── Build Product Map ────────────────────────────────────
+// Cross-references all three supplier inventory tables by mfr_part_number
+// to build a unified mapping of MPN → supplier-specific IDs.
+
+async function fetchAllRows(table, columns) {
+  const allRows = [];
+  const PAGE = 1000;
+  let offset = 0;
+  while (true) {
+    const { data, error } = await supabase
+      .from(table)
+      .select(columns)
+      .not("mfr_part_number", "is", null)
+      .range(offset, offset + PAGE - 1);
+    if (error) throw error;
+    allRows.push(...data);
+    if (data.length < PAGE) break;
+    offset += PAGE;
+  }
+  return allRows;
+}
+
+async function buildProductMap() {
+  console.log("[product_map] Building from synced inventory...");
+
+  const [t14Rows, ekeyRows, meyRows] = await Promise.all([
+    fetchAllRows("turn14_inventory", "product_id, mfr_part_number, stock"),
+    fetchAllRows("ekeystone_inventory", "vcpn, mfr_part_number, stock"),
+    fetchAllRows("meyer_inventory", "meyer_sku, mfr_part_number, stock"),
+  ]);
+
+  console.log(
+    `[product_map] Source rows — Turn14: ${t14Rows.length}, eKeystone: ${ekeyRows.length}, Meyer: ${meyRows.length}`
+  );
+
+  const map = new Map();
+
+  for (const r of t14Rows) {
+    const entry = map.get(r.mfr_part_number) || { mpn: r.mfr_part_number };
+    // if duplicate MPN within Turn14, keep the row with highest stock
+    if (!entry.turn14_product_id || r.stock > (entry._t14s || 0)) {
+      entry.turn14_product_id = r.product_id;
+      entry._t14s = r.stock;
+    }
+    map.set(r.mfr_part_number, entry);
+  }
+
+  for (const r of ekeyRows) {
+    const entry = map.get(r.mfr_part_number) || { mpn: r.mfr_part_number };
+    if (!entry.ekeystone_vcpn || r.stock > (entry._eks || 0)) {
+      entry.ekeystone_vcpn = r.vcpn;
+      entry._eks = r.stock;
+    }
+    map.set(r.mfr_part_number, entry);
+  }
+
+  for (const r of meyRows) {
+    const entry = map.get(r.mfr_part_number) || { mpn: r.mfr_part_number };
+    if (!entry.meyer_sku || r.stock > (entry._ms || 0)) {
+      entry.meyer_sku = r.meyer_sku;
+      entry._ms = r.stock;
+    }
+    map.set(r.mfr_part_number, entry);
+  }
+
+  // strip internal tracking fields, prepare for upsert
+  const rows = [...map.values()].map((e) => ({
+    mpn: e.mpn,
+    turn14_product_id: e.turn14_product_id || null,
+    ekeystone_vcpn: e.ekeystone_vcpn || null,
+    meyer_sku: e.meyer_sku || null,
+  }));
+
+  console.log(`[product_map] ${rows.length} unique MPNs across all suppliers`);
+
+  const CHUNK = 500;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const chunk = rows.slice(i, i + CHUNK);
+    const { error } = await supabase
+      .from("product_map")
+      .upsert(chunk, { onConflict: "mpn" });
+    if (error) throw error;
+  }
+
+  console.log(`[product_map] Upserted ${rows.length} mappings`);
+}
+
 // ── Main ────────────────────────────────────────────────
 
 async function main() {
   console.log("=== Inventory Sync ===\n");
 
-  // run all syncs
-  await syncEkeystone();
+  // run all syncs — continue on individual failures so the rest still complete
+  try { await syncEkeystone(); } catch (err) { console.error("[ekeystone] Sync failed:", err.message); }
   console.log("");
-  await syncMeyer();
+  try { await syncMeyer(); } catch (err) { console.error("[meyer] Sync failed:", err.message); }
   console.log("");
-  await syncTurn14();
+  try { await syncTurn14(); } catch (err) { console.error("[turn14] Sync failed:", err.message); }
+  console.log("");
+  try { await buildProductMap(); } catch (err) { console.error("[product_map] Build failed:", err.message); }
 
   console.log("\n=== Done ===");
   process.exit(0);

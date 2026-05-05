@@ -33,13 +33,20 @@ create table if not exists order_lines (
   -- drop-ship flag (set from "Contains DS Items" tag)
   is_ds            boolean default false,
 
+  -- stable identity from Ordoro (preferred over line_number index)
+  ordoro_line_id   text,
+
+  -- retry tracking for failed lines
+  retry_count      int default 0,
+
   -- state machine
   status           text not null default 'pending'
     check (status in ('pending', 'decided', 'ordering', 'ordered', 'failed')),
   external_order_id text,
   idempotency_key  text,
 
-  created_at       timestamptz default now()
+  created_at       timestamptz default now(),
+  updated_at       timestamptz default now()
 );
 
 create index if not exists idx_order_lines_order on order_lines(order_id);
@@ -103,3 +110,10 @@ create table if not exists sync_state (
   value      text,
   updated_at timestamptz default now()
 );
+
+-- ── Migration for existing databases ─────────────────────
+-- Run these ALTER statements if the tables already exist:
+--
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS ordoro_line_id text;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS retry_count int DEFAULT 0;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();

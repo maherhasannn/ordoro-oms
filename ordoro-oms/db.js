@@ -10,8 +10,8 @@ const supabase = createClient(
 
 export async function upsertOrder(order) {
   const lines = order.lines || [];
-  const tags = (order.tags || []).map((t) => t.text || t);
-  const isDs = tags.includes("Contains DS Items");
+  const tags = (Array.isArray(order.tags) ? order.tags : []).map((t) => t.text || t);
+  const containsDs = tags.some((t) => t.toLowerCase().includes("contains ds"));
 
   // upsert top-level order
   const { error: orderErr } = await supabase.from("orders").upsert(
@@ -32,28 +32,78 @@ export async function upsertOrder(order) {
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     const sku = l.sku || l.product?.sku || null;
-    const mpn = l.product?.mpn || l.product?.upc || sku;
+    // Ordoro may provide MPN on a nested product object or not at all — fall back to SKU
+    const mpn = l.product?.mpn || sku;
 
-    // use order_id + line_number as logical key (upsert via raw SQL isn't
-    // needed — we just insert if not existing, skip if already decided)
-    const { data: existing } = await supabase
-      .from("order_lines")
-      .select("id")
-      .eq("order_id", order.order_number)
-      .eq("line_number", i)
-      .maybeSingle();
+    // Ordoro flattens product fields onto the line (product_name, product_tags, shippability)
+    const lineTags = (l.product_tags || l.product?.tags || []).map((t) => t.text || t);
+    const lineIsDs =
+      containsDs ||
+      l.shippability?.is_dropship === true ||
+      lineTags.includes("Drop Ship") ||
+      lineTags.includes("DS");
 
+    // Fix: use Ordoro's line item ID for stable identity (array index is fragile)
+    const ordoroLineId = l.id != null ? String(l.id) : null;
+
+    // Look up existing line — prefer ordoro_line_id, fall back to line_number
+    let existing = null;
+    if (ordoroLineId) {
+      const { data } = await supabase
+        .from("order_lines")
+        .select("id, status, ordoro_line_id")
+        .eq("order_id", order.order_number)
+        .eq("ordoro_line_id", ordoroLineId)
+        .maybeSingle();
+      existing = data;
+    }
     if (!existing) {
+      const { data } = await supabase
+        .from("order_lines")
+        .select("id, status, ordoro_line_id")
+        .eq("order_id", order.order_number)
+        .eq("line_number", i)
+        .maybeSingle();
+      existing = data;
+    }
+
+    const now = new Date().toISOString();
+
+    if (existing) {
+      // Fix: update mutable fields on pending lines (qty/price may have changed)
+      if (existing.status === "pending") {
+        const updateFields = {
+          sku,
+          mpn,
+          product_name: l.product_name || l.product?.name || null,
+          quantity: l.quantity || 1,
+          unit_price: l.unit_price ?? l.item_price ?? null,
+          is_ds: lineIsDs,
+          updated_at: now,
+        };
+        // Backfill ordoro_line_id on legacy rows
+        if (!existing.ordoro_line_id && ordoroLineId) {
+          updateFields.ordoro_line_id = ordoroLineId;
+        }
+        const { error: updateErr } = await supabase
+          .from("order_lines")
+          .update(updateFields)
+          .eq("id", existing.id);
+        if (updateErr) throw updateErr;
+      }
+    } else {
       const { error: lineErr } = await supabase.from("order_lines").insert({
         order_id: order.order_number,
         line_number: i,
+        ordoro_line_id: ordoroLineId,
         sku,
         mpn,
-        product_name: l.product?.name || null,
+        product_name: l.product_name || l.product?.name || null,
         quantity: l.quantity || 1,
         unit_price: l.unit_price ?? l.item_price ?? null,
         status: "pending",
-        is_ds: isDs,
+        is_ds: lineIsDs,
+        updated_at: now,
       });
       if (lineErr) throw lineErr;
     }
@@ -89,12 +139,14 @@ export async function lookupProductMap(mpn) {
 // ── Fulfillment Decision ────────────────────────────────
 
 export async function updateOrderLineDecision(lineId, decision) {
+  const now = new Date().toISOString();
   const update = {
     chosen_supplier: decision.chosen_supplier || null,
     supplier_cost: decision.supplier_cost ?? null,
     supplier_stock: decision.supplier_stock ?? null,
     decision_reason: decision.decision_reason || null,
-    decided_at: new Date().toISOString(),
+    decided_at: now,
+    updated_at: now,
     status: decision.chosen_supplier ? "decided" : "failed",
   };
   if (decision.chosen_supplier && decision.order_id != null && decision.line_number != null) {
@@ -169,11 +221,26 @@ export async function getMeyerInventory(sku) {
 
 // ── MPN-based Inventory Lookups ─────────────────────────
 
+// Fix: use .order().limit(1) before .maybeSingle() to handle duplicate MPNs
+// without throwing. Picks the row with the highest stock for each MPN.
+
+export async function getTurn14ById(productId) {
+  const { data, error } = await supabase
+    .from("turn14_inventory")
+    .select("*")
+    .eq("product_id", productId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
 export async function getTurn14ByMpn(mpn) {
   const { data, error } = await supabase
     .from("turn14_inventory")
     .select("*")
     .eq("mfr_part_number", mpn)
+    .order("stock", { ascending: false })
+    .limit(1)
     .maybeSingle();
   if (error) throw error;
   return data;
@@ -184,6 +251,8 @@ export async function getEkeystoneByMpn(mpn) {
     .from("ekeystone_inventory")
     .select("*")
     .eq("mfr_part_number", mpn)
+    .order("stock", { ascending: false })
+    .limit(1)
     .maybeSingle();
   if (error) throw error;
   return data;
@@ -194,6 +263,8 @@ export async function getMeyerByMpn(mpn) {
     .from("meyer_inventory")
     .select("*")
     .eq("mfr_part_number", mpn)
+    .order("stock", { ascending: false })
+    .limit(1)
     .maybeSingle();
   if (error) throw error;
   return data;
@@ -232,7 +303,7 @@ export async function setSyncState(key, value) {
 export async function claimLineForOrdering(lineId) {
   const { data, error } = await supabase
     .from("order_lines")
-    .update({ status: "ordering" })
+    .update({ status: "ordering", updated_at: new Date().toISOString() })
     .eq("id", lineId)
     .eq("status", "decided")
     .select("id");
@@ -249,6 +320,7 @@ export async function markLineOrdered(lineId, externalOrderId) {
     .update({
       status: "ordered",
       external_order_id: externalOrderId || null,
+      updated_at: new Date().toISOString(),
     })
     .eq("id", lineId)
     .eq("status", "ordering");
@@ -262,6 +334,7 @@ export async function markLineFailed(lineId, reason, retry = false) {
   const update = {
     status: retry ? "pending" : "failed",
     decision_reason: reason,
+    updated_at: new Date().toISOString(),
   };
   if (retry) {
     // clear previous decision so it can be re-evaluated
@@ -284,13 +357,56 @@ export async function markLineFailed(lineId, reason, retry = false) {
  */
 export async function getStuckOrderingLines(olderThanMinutes = 10) {
   const cutoff = new Date(Date.now() - olderThanMinutes * 60 * 1000).toISOString();
+  // Fix: use updated_at (set when entering 'ordering') instead of decided_at
+  // (set when entering 'decided', which can be much earlier)
   const { data, error } = await supabase
     .from("order_lines")
     .select("*")
     .eq("status", "ordering")
-    .lt("decided_at", cutoff);
+    .lt("updated_at", cutoff);
   if (error) throw error;
   return data || [];
+}
+
+// ── Retry: re-evaluate old failed lines ──────────────────
+
+/**
+ * Find failed DS lines eligible for automatic retry.
+ * Lines must be older than the cooldown period and under the max retry count.
+ */
+export async function getRetryableFailedLines(olderThanMs = 4 * 60 * 60 * 1000, maxRetries = 3) {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const { data, error } = await supabase
+    .from("order_lines")
+    .select("*")
+    .eq("status", "failed")
+    .eq("is_ds", true)
+    .lt("decided_at", cutoff)
+    .or(`retry_count.lt.${maxRetries},retry_count.is.null`);
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Reset a failed line back to pending for re-evaluation.
+ * Uses an optimistic lock on status='failed' to prevent races.
+ */
+export async function resetLineForRetry(lineId, currentRetryCount) {
+  const { error } = await supabase
+    .from("order_lines")
+    .update({
+      status: "pending",
+      chosen_supplier: null,
+      supplier_cost: null,
+      supplier_stock: null,
+      decided_at: null,
+      idempotency_key: null,
+      retry_count: (currentRetryCount || 0) + 1,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", lineId)
+    .eq("status", "failed"); // optimistic lock
+  if (error) throw error;
 }
 
 export default supabase;

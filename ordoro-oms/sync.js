@@ -10,6 +10,9 @@ import {
   setSyncState,
   getStuckOrderingLines,
   markLineFailed,
+  getRetryableFailedLines,
+  resetLineForRetry,
+  lookupProductMap,
 } from "./db.js";
 import { withTimeout } from "./lib/timeout.js";
 import * as turn14 from "./suppliers/turn14.js";
@@ -20,7 +23,8 @@ import { alertUnfulfillable } from "./lib/notify.js";
 
 // ── Config ──────────────────────────────────────────────
 
-const POLL_INTERVAL = 180_000; // 15 seconds
+const POLL_INTERVAL = 180_000; // 3 minutes
+const MAX_CACHE_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours — reject eKeystone cache older than this
 const EKEYSTONE_SYNC_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours (feed updates daily)
 const MEYER_SYNC_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours (Meyer pushes periodically)
 const WATERMARK_KEY = "ordoro_last_sync";
@@ -34,22 +38,35 @@ const auth = Buffer.from(
 // ── Ordoro Polling ──────────────────────────────────────
 
 async function fetchOrders(since) {
-  const res = await withTimeout(
-    axios.get(
-      `https://api.ordoro.com/v3/order?updated_after=${encodeURIComponent(since)}&limit=50`,
-      { headers: { Authorization: `Basic ${auth}` } }
-    ),
-    ORDORO_API_TIMEOUT,
-    "ordoro fetchOrders"
-  );
-  return res.data.order || [];
+  const allOrders = [];
+  let offset = 0;
+  const limit = 50;
+
+  // Fix: paginate to avoid silently dropping orders when >50 are updated
+  while (true) {
+    const res = await withTimeout(
+      axios.get(
+        `https://api.ordoro.com/v3/order?updated_after=${encodeURIComponent(since)}&limit=${limit}&offset=${offset}`,
+        { headers: { Authorization: `Basic ${auth}` } }
+      ),
+      ORDORO_API_TIMEOUT,
+      "ordoro fetchOrders"
+    );
+    const orders = res.data.order || [];
+    allOrders.push(...orders);
+
+    if (orders.length < limit) break; // last page
+    offset += limit;
+  }
+
+  return allOrders;
 }
 
 // ── Supplier Check (isolated try/catch per supplier) ────
 
-async function checkSupplierByMpn(name, fn, mpn) {
+async function checkSupplierByMpn(name, fn, mpn, mappedId) {
   try {
-    return await fn(mpn);
+    return await fn(mpn, mappedId);
   } catch (err) {
     console.error(`  [${name}] error for MPN ${mpn}: ${err.message}`);
     return null;
@@ -77,20 +94,22 @@ async function processLine(line) {
   const MIN_STOCK_BUFFER = 4;
   const minStock = Math.max(line.quantity, MIN_STOCK_BUFFER);
 
-  // 1. Check all 3 suppliers by MPN in parallel
+  // 1. Look up product_map for supplier-specific IDs (handles MPN mismatches)
+  const mapping = await lookupProductMap(line.mpn);
+
+  // 2. Check all 3 suppliers in parallel — prefer mapped ID, fall back to MPN
   const [t14, ekey, mey] = await Promise.all([
-    checkSupplierByMpn("turn14", turn14.checkByMpn, line.mpn),
-    checkSupplierByMpn("ekeystone", ekeystone.checkByMpn, line.mpn),
-    checkSupplierByMpn("meyer", meyer.checkByMpn, line.mpn),
+    checkSupplierByMpn("turn14", turn14.checkByMpn, line.mpn, mapping?.turn14_product_id),
+    checkSupplierByMpn("ekeystone", ekeystone.checkByMpn, line.mpn, mapping?.ekeystone_vcpn),
+    checkSupplierByMpn("meyer", meyer.checkByMpn, line.mpn, mapping?.meyer_sku),
   ]);
 
   const results = [t14, ekey, mey].filter(Boolean);
 
   if (results.length === 0) {
-    console.log(`  ${tag} — all supplier checks failed`);
-    await updateOrderLineDecision(line.id, {
-      decision_reason: "all supplier checks failed",
-    });
+    // Fix: transient errors — leave as pending so it retries next cycle
+    // instead of permanently marking as failed
+    console.log(`  ${tag} — all supplier checks failed (will retry next cycle)`);
     return;
   }
 
@@ -98,19 +117,36 @@ async function processLine(line) {
   const decision = selectBestDeal(results, line.quantity);
 
   // 4. Live verification — confirm stock in real-time before committing
-  if (decision.chosen_supplier) {
-    // sort eligible suppliers by cost (cheapest first) for fallback
-    const candidates = results
-      .filter((r) => r.stock >= minStock && r.cost > 0)
-      .sort((a, b) => a.cost - b.cost);
+  // Include any supplier with enough stock (even if cached cost is missing,
+  // e.g. Turn14 bulk sync doesn't fetch per-item pricing). Known-cost
+  // suppliers sort first; unknown-cost ones go last as fallbacks whose
+  // cost will be resolved by the live check.
+  const candidates = results
+    .filter((r) => r.stock >= minStock && r.supplierId)
+    .sort((a, b) => (a.cost || Infinity) - (b.cost || Infinity));
 
+  if (candidates.length > 0) {
     let verified = false;
     for (const candidate of candidates) {
       const liveCheckFn = LIVE_CHECK_FN[candidate.supplier];
       const liveResult = await liveCheckFn(candidate.supplierId);
 
       if (liveResult.status === "no_api") {
-        // eKeystone: no live API, trust cached data
+        // No live API (e.g., eKeystone) — need both a cached cost and fresh cache
+        if (!candidate.cost || candidate.cost <= 0) {
+          console.log(`  ${tag} -> ${candidate.supplier} has no live API and no cached cost, skipping`);
+          continue;
+        }
+        const cacheAge = candidate.cachedAt
+          ? Date.now() - new Date(candidate.cachedAt).getTime()
+          : Infinity;
+
+        if (cacheAge > MAX_CACHE_AGE_MS) {
+          const ageHrs = Math.round(cacheAge / 3_600_000);
+          console.log(`  ${tag} -> ${candidate.supplier} cache too stale (${ageHrs}h old), skipping`);
+          continue;
+        }
+
         console.log(`  ${tag} -> verified ${candidate.supplier} (no live API, using cached: ${candidate.stock} in stock)`);
         decision.chosen_supplier = candidate.supplier;
         decision.supplier_cost = candidate.cost;
@@ -126,11 +162,16 @@ async function processLine(line) {
         continue;
       }
 
-      // status === "ok" — verify stock
+      // status === "ok" — verify stock and resolve cost
       if (liveResult.stock >= minStock) {
-        console.log(`  ${tag} -> live verified ${candidate.supplier} (live stock: ${liveResult.stock}, cost: $${liveResult.cost})`);
+        const liveCost = liveResult.cost || candidate.cost;
+        if (!liveCost || liveCost <= 0) {
+          console.log(`  ${tag} -> ${candidate.supplier} live verified stock but no cost available, skipping`);
+          continue;
+        }
+        console.log(`  ${tag} -> live verified ${candidate.supplier} (live stock: ${liveResult.stock}, cost: $${liveCost})`);
         decision.chosen_supplier = candidate.supplier;
-        decision.supplier_cost = liveResult.cost || candidate.cost;
+        decision.supplier_cost = liveCost;
         decision.supplier_stock = liveResult.stock;
         decision.decision_reason = `cheapest with ${minStock}+ stock (live verified)`;
         verified = true;
@@ -173,7 +214,16 @@ async function processLine(line) {
 
 // ── Main Poll Cycle ─────────────────────────────────────
 
+let pollRunning = false;
+
 async function pollCycle() {
+  // Fix: guard against concurrent cycles when a cycle exceeds POLL_INTERVAL
+  if (pollRunning) {
+    console.log("[poll] Previous cycle still running — skipping");
+    return;
+  }
+  pollRunning = true;
+
   try {
     // load watermark
     let lastSync =
@@ -193,7 +243,7 @@ async function pollCycle() {
       // upsert to Supabase
       for (const o of orders) {
         await upsertOrder(o);
-        const tags = (o.tags || []).map(t => t.text || t);
+        const tags = (Array.isArray(o.tags) ? o.tags : []).map(t => t.text || t);
         const isDs = tags.includes("Contains DS Items");
         const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
         console.log(`  Saved order ${o.order_number} [tags: ${tagStr}]${isDs ? " ★ DS" : " — skipping (no DS tag)"}`);
@@ -220,8 +270,23 @@ async function pollCycle() {
         await processLine(line);
       }
     }
+
+    // Fix: periodically retry failed lines (stock may have been restocked)
+    try {
+      const retryable = await getRetryableFailedLines();
+      if (retryable.length > 0) {
+        console.log(`[retry] Resetting ${retryable.length} failed line(s) for re-evaluation`);
+        for (const line of retryable) {
+          await resetLineForRetry(line.id, line.retry_count);
+        }
+      }
+    } catch (retryErr) {
+      console.error("[retry] Error checking retryable lines:", retryErr.message);
+    }
   } catch (err) {
     console.error("[poll] Top-level error:", err.message);
+  } finally {
+    pollRunning = false;
   }
 }
 
@@ -279,7 +344,7 @@ async function main() {
   // }
   console.log("[startup] Feed syncs disabled for testing — polling only");
 
-  // first poll immediately, then every 15s
+  // first poll immediately, then every 3 minutes
   await pollCycle();
   setInterval(pollCycle, POLL_INTERVAL);
 }
