@@ -238,16 +238,20 @@ async function pollCycle() {
     if (orders.length === 0) {
       console.log("[poll] No new orders");
     } else {
+      console.log(`[poll] Fetched ${orders.length} order(s)`);
+
       // upsert to Supabase
       for (const o of orders) {
         await upsertOrder(o);
         const tags = (Array.isArray(o.tags) ? o.tags : []).map(t => t.text || t);
         const isDs = tags.includes("Contains DS Items");
         const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
-        console.log(`[poll]  ${isDs ? "★ DS" : "    "} ${o.order_number} [tags: ${tagStr}]`);
+        const updatedAt = o.updated_at || o.created_date;
+        console.log(`[poll]  ${isDs ? "★ DS" : "    "} ${o.order_number} [tags: ${tagStr}] updated=${updatedAt}`);
       }
 
-      // advance watermark — only move forward, never backwards
+      // advance watermark past the newest order (+1ms to avoid re-fetching
+      // the same order, since Ordoro's updated_after is inclusive/>=)
       const newest = orders.reduce(
         (max, o) =>
           new Date(o.updated_at || o.created_date) > new Date(max)
@@ -255,10 +259,14 @@ async function pollCycle() {
             : max,
         lastSync
       );
-      if (new Date(newest) > new Date(lastSync)) {
-        const watermark = newest;
+      const newestMs = new Date(newest).getTime();
+      const lastSyncMs = new Date(lastSync).getTime();
+      if (newestMs >= lastSyncMs) {
+        const watermark = new Date(newestMs + 1).toISOString();
         await setSyncState(WATERMARK_KEY, watermark);
-        console.log(`[poll] Watermark advanced to ${watermark}`);
+        console.log(`[poll] Watermark: ${lastSync} -> ${watermark} (newest order: ${newest})`);
+      } else {
+        console.warn(`[poll] WARNING: newest order (${newest}) is older than watermark (${lastSync}) — not advancing`);
       }
     }
 
