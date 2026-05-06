@@ -36,7 +36,7 @@ async function isComponentDropShip(mpn) {
 
 // ── Orders ──────────────────────────────────────────────
 
-export async function upsertOrder(order, fetchKitGraph) {
+export async function upsertOrder(order, fetchKitComponents) {
   const lines = order.lines || [];
   const tags = (Array.isArray(order.tags) ? order.tags : []).map((t) => t.text || t);
   const kitExpansions = []; // returned to caller for logging
@@ -63,10 +63,10 @@ export async function upsertOrder(order, fetchKitGraph) {
     const isKitParent = l.product_is_kit_parent === true || l.product?.is_kit_parent === true;
 
     // ── Kit expansion ──────────────────────────────────
-    if (isKitParent && fetchKitGraph && sku) {
+    if (isKitParent && fetchKitComponents && sku) {
       let components;
       try {
-        components = await fetchKitGraph(sku);
+        components = await fetchKitComponents(sku);
       } catch (err) {
         console.error(`[kit] Failed to fetch kit_graph for ${sku}: ${err.message} — inserting parent line as fallback`);
         components = null;

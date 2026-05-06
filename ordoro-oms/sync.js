@@ -35,19 +35,19 @@ const auth = Buffer.from(
   `${process.env.ORDORO_CLIENT}:${process.env.ORDORO_SECRET}`
 ).toString("base64");
 
-// ── Kit Graph ────────────────────────────────────────────
+// ── Kit Components ───────────────────────────────────────
 
-async function fetchKitGraph(sku) {
+async function fetchKitComponents(sku) {
   const res = await withTimeout(
     axios.get(
-      `https://api.ordoro.com/product/${encodeURIComponent(sku)}/kit_graph/`,
+      `https://api.ordoro.com/product/${encodeURIComponent(sku)}/`,
       { headers: { Authorization: `Basic ${auth}` } }
     ),
     ORDORO_API_TIMEOUT,
-    `ordoro kit_graph ${sku}`
+    `ordoro product ${sku}`
   );
-  const edges = (res.data.edges || []).filter((e) => e.source === sku);
-  return edges.map((e) => ({ componentSku: e.dest, quantity: e.weight }));
+  const components = res.data.kit_components || [];
+  return components.map((c) => ({ componentSku: c.sku, quantity: c.quantity }));
 }
 
 // ── Ordoro Polling ──────────────────────────────────────
@@ -257,7 +257,7 @@ async function pollCycle() {
 
       // upsert to Supabase (idempotent — re-fetched orders are harmless)
       for (const o of orders) {
-        const kitExpansions = await upsertOrder(o, fetchKitGraph);
+        const kitExpansions = await upsertOrder(o, fetchKitComponents);
         const tags = (Array.isArray(o.tags) ? o.tags : []).map(t => t.text || t);
         const isDs = tags.includes("Contains DS Items");
         const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
