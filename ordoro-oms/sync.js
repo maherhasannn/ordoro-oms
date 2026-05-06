@@ -238,18 +238,23 @@ async function pollCycle() {
     if (orders.length === 0) {
       console.log("[poll] No new orders");
     } else {
-      console.log(`[poll] Found ${orders.length} orders`);
-
       // upsert to Supabase
+      let dsCount = 0;
+      let nonDsCount = 0;
       for (const o of orders) {
         await upsertOrder(o);
         const tags = (Array.isArray(o.tags) ? o.tags : []).map(t => t.text || t);
         const isDs = tags.includes("Contains DS Items");
-        const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
-        console.log(`  Saved order ${o.order_number} [tags: ${tagStr}]${isDs ? " ★ DS" : " — skipping (no DS tag)"}`);
+        if (isDs) {
+          dsCount++;
+          console.log(`[poll] ★ DS order ${o.order_number} [tags: ${tags.join(", ")}]`);
+        } else {
+          nonDsCount++;
+        }
       }
+      console.log(`[poll] Synced ${orders.length} orders (${dsCount} DS, ${nonDsCount} non-DS)`);
 
-      // advance watermark
+      // advance watermark — only move forward, never backwards
       const newest = orders.reduce(
         (max, o) =>
           new Date(o.updated_at || o.created_date) > new Date(max)
@@ -257,9 +262,11 @@ async function pollCycle() {
             : max,
         lastSync
       );
-      const watermark = new Date(new Date(newest).getTime() - WATERMARK_OVERLAP_MS).toISOString();
-      await setSyncState(WATERMARK_KEY, watermark);
-      console.log(`[poll] Watermark advanced to ${watermark} (30s overlap)`);
+      if (new Date(newest) > new Date(lastSync)) {
+        const watermark = newest;
+        await setSyncState(WATERMARK_KEY, watermark);
+        console.log(`[poll] Watermark advanced to ${watermark}`);
+      }
     }
 
     // process unprocessed lines (from this batch and any previous)
