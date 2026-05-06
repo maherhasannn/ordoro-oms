@@ -239,20 +239,13 @@ async function pollCycle() {
       console.log("[poll] No new orders");
     } else {
       // upsert to Supabase
-      let dsCount = 0;
-      let nonDsCount = 0;
       for (const o of orders) {
         await upsertOrder(o);
         const tags = (Array.isArray(o.tags) ? o.tags : []).map(t => t.text || t);
         const isDs = tags.includes("Contains DS Items");
-        if (isDs) {
-          dsCount++;
-          console.log(`[poll] ★ DS order ${o.order_number} [tags: ${tags.join(", ")}]`);
-        } else {
-          nonDsCount++;
-        }
+        const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
+        console.log(`[poll]  ${isDs ? "★ DS" : "    "} ${o.order_number} [tags: ${tagStr}]`);
       }
-      console.log(`[poll] Synced ${orders.length} orders (${dsCount} DS, ${nonDsCount} non-DS)`);
 
       // advance watermark — only move forward, never backwards
       const newest = orders.reduce(
