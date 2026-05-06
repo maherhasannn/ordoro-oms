@@ -47,7 +47,11 @@ export async function sendAlert(subject, body) {
  * Build and send an alert for an unfulfillable order line.
  */
 export async function alertUnfulfillable(line, decision) {
-  const subject = `OMS Alert: Cannot fulfill ${line.sku || line.mpn} (Order #${line.order_id})`;
+  const isKitComponent = !!line.kit_parent_sku;
+  const itemLabel = line.mpn || line.sku || "unknown";
+  const subject = isKitComponent
+    ? `OMS Alert: Cannot fulfill kit component ${itemLabel} (Order #${line.order_id}, kit ${line.kit_parent_sku})`
+    : `OMS Alert: Cannot fulfill ${itemLabel} (Order #${line.order_id})`;
 
   const supplierBreakdown = (decision.allResults || [])
     .map(
@@ -56,9 +60,18 @@ export async function alertUnfulfillable(line, decision) {
     )
     .join("\n");
 
-  const body = [
+  const lines = [
     `Order:    #${line.order_id}`,
-    `SKU:      ${line.sku || "N/A"}`,
+  ];
+
+  if (isKitComponent) {
+    lines.push(`Kit SKU:  ${line.kit_parent_sku}`);
+    lines.push(`Component SKU: ${line.sku || "N/A"}`);
+  } else {
+    lines.push(`SKU:      ${line.sku || "N/A"}`);
+  }
+
+  lines.push(
     `MPN:      ${line.mpn || "N/A"}`,
     `Product:  ${line.product_name || "N/A"}`,
     `Qty needed: ${line.quantity}`,
@@ -70,7 +83,7 @@ export async function alertUnfulfillable(line, decision) {
     supplierBreakdown || "  (no suppliers checked)",
     ``,
     `Action required: manually source this item or wait for restock.`,
-  ].join("\n");
+  );
 
-  await sendAlert(subject, body);
+  await sendAlert(subject, lines.join("\n"));
 }

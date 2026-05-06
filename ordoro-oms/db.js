@@ -6,12 +6,40 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── Kit Helpers ──────────────────────────────────────────
+
+/**
+ * Extract manufacturer part number from a component SKU.
+ * Convention: "BRAND-MPN" → strips everything before the first hyphen.
+ * e.g. "BIL-24-188241" → "24-188241", "RAN-RS55042" → "RS55042"
+ * Falls back to the full SKU if no hyphen is found.
+ */
+function extractMpnFromSku(sku) {
+  if (!sku) return null;
+  const idx = sku.indexOf("-");
+  return idx > 0 ? sku.slice(idx + 1) : sku;
+}
+
+/**
+ * Check if a component MPN exists at any supplier.
+ * Returns true if at least one supplier has a matching record (DS-eligible).
+ */
+async function isComponentDropShip(mpn) {
+  if (!mpn) return false;
+  const [t14, ekey, mey] = await Promise.all([
+    getTurn14ByMpn(mpn),
+    getEkeystoneByMpn(mpn),
+    getMeyerByMpn(mpn),
+  ]);
+  return !!(t14 || ekey || mey);
+}
+
 // ── Orders ──────────────────────────────────────────────
 
-export async function upsertOrder(order) {
+export async function upsertOrder(order, fetchKitGraph) {
   const lines = order.lines || [];
   const tags = (Array.isArray(order.tags) ? order.tags : []).map((t) => t.text || t);
-  const containsDs = tags.some((t) => t.toLowerCase().includes("contains ds"));
+  const kitExpansions = []; // returned to caller for logging
 
   // upsert top-level order
   const { error: orderErr } = await supabase.from("orders").upsert(
@@ -32,13 +60,86 @@ export async function upsertOrder(order) {
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     const sku = l.sku || l.product?.sku || null;
+    const isKitParent = l.product_is_kit_parent === true || l.product?.is_kit_parent === true;
+
+    // ── Kit expansion ──────────────────────────────────
+    if (isKitParent && fetchKitGraph && sku) {
+      let components;
+      try {
+        components = await fetchKitGraph(sku);
+      } catch (err) {
+        console.error(`[kit] Failed to fetch kit_graph for ${sku}: ${err.message} — inserting parent line as fallback`);
+        components = null;
+      }
+
+      if (components && components.length > 0) {
+        // Check if we already expanded this kit (idempotency)
+        const { data: existingComponents } = await supabase
+          .from("order_lines")
+          .select("id")
+          .eq("order_id", order.order_number)
+          .eq("kit_parent_sku", sku)
+          .limit(1);
+
+        if (existingComponents && existingComponents.length > 0) {
+          // Already expanded — skip re-expansion
+          continue;
+        }
+
+        let dsCount = 0;
+        let warehouseCount = 0;
+        const ordoroLineId = l.id != null ? String(l.id) : null;
+        const now = new Date().toISOString();
+
+        for (let c = 0; c < components.length; c++) {
+          const comp = components[c];
+          const compMpn = extractMpnFromSku(comp.componentSku);
+          const compIsDs = await isComponentDropShip(compMpn);
+          const compStatus = compIsDs ? "pending" : "manual";
+
+          if (compIsDs) dsCount++;
+          else warehouseCount++;
+
+          const compOrdoroLineId = ordoroLineId
+            ? `${ordoroLineId}-comp-${c}`
+            : null;
+
+          const { error: compErr } = await supabase.from("order_lines").insert({
+            order_id: order.order_number,
+            line_number: i,
+            ordoro_line_id: compOrdoroLineId,
+            sku: comp.componentSku,
+            mpn: compMpn,
+            product_name: l.product_name || l.product?.name || null,
+            quantity: (l.quantity || 1) * (comp.quantity || 1),
+            unit_price: null, // kit components don't have individual prices from Ordoro
+            status: compStatus,
+            is_ds: compIsDs,
+            kit_parent_sku: sku,
+            updated_at: now,
+          });
+          if (compErr) throw compErr;
+        }
+
+        kitExpansions.push({
+          lineIndex: i,
+          kitSku: sku,
+          dsCount,
+          warehouseCount,
+        });
+
+        continue; // don't insert the parent kit line itself
+      }
+      // If kit_graph returned empty or failed, fall through to insert parent line
+    }
+
+    // ── Normal (non-kit) line ──────────────────────────
     // Ordoro may provide MPN on a nested product object or not at all — fall back to SKU
     const mpn = l.product?.mpn || sku;
 
     // Ordoro flattens product fields onto the line (product_name, product_tags, shippability)
     const lineTags = (l.product_tags || l.product?.tags || []).map((t) => t.text || t);
     const lineIsDs =
-      containsDs ||
       l.shippability?.is_dropship === true ||
       lineTags.includes("Drop Ship") ||
       lineTags.includes("DS");
@@ -108,6 +209,8 @@ export async function upsertOrder(order) {
       if (lineErr) throw lineErr;
     }
   }
+
+  return kitExpansions;
 }
 
 // ── Unprocessed Lines ───────────────────────────────────

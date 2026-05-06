@@ -35,6 +35,21 @@ const auth = Buffer.from(
   `${process.env.ORDORO_CLIENT}:${process.env.ORDORO_SECRET}`
 ).toString("base64");
 
+// ── Kit Graph ────────────────────────────────────────────
+
+async function fetchKitGraph(sku) {
+  const res = await withTimeout(
+    axios.get(
+      `https://api.ordoro.com/product/${encodeURIComponent(sku)}/kit_graph/`,
+      { headers: { Authorization: `Basic ${auth}` } }
+    ),
+    ORDORO_API_TIMEOUT,
+    `ordoro kit_graph ${sku}`
+  );
+  const edges = (res.data.edges || []).filter((e) => e.source === sku);
+  return edges.map((e) => ({ componentSku: e.dest, quantity: e.weight }));
+}
+
 // ── Ordoro Polling ──────────────────────────────────────
 
 async function fetchOrders(since) {
@@ -240,35 +255,27 @@ async function pollCycle() {
     } else {
       console.log(`[poll] Fetched ${orders.length} order(s)`);
 
-      // upsert to Supabase
+      // upsert to Supabase (idempotent — re-fetched orders are harmless)
       for (const o of orders) {
-        await upsertOrder(o);
+        const kitExpansions = await upsertOrder(o, fetchKitGraph);
         const tags = (Array.isArray(o.tags) ? o.tags : []).map(t => t.text || t);
         const isDs = tags.includes("Contains DS Items");
         const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
         const updatedAt = o.updated_at || o.created_date;
         console.log(`[poll]  ${isDs ? "★ DS" : "    "} ${o.order_number} [tags: ${tagStr}] updated=${updatedAt}`);
-      }
-
-      // advance watermark past the newest order (+1ms to avoid re-fetching
-      // the same order, since Ordoro's updated_after is inclusive/>=)
-      const newest = orders.reduce(
-        (max, o) =>
-          new Date(o.updated_at || o.created_date) > new Date(max)
-            ? o.updated_at || o.created_date
-            : max,
-        lastSync
-      );
-      const newestMs = new Date(newest).getTime();
-      const lastSyncMs = new Date(lastSync).getTime();
-      if (newestMs >= lastSyncMs) {
-        const watermark = new Date(newestMs + 1).toISOString();
-        await setSyncState(WATERMARK_KEY, watermark);
-        console.log(`[poll] Watermark: ${lastSync} -> ${watermark} (newest order: ${newest})`);
-      } else {
-        console.warn(`[poll] WARNING: newest order (${newest}) is older than watermark (${lastSync}) — not advancing`);
+        for (const exp of kitExpansions) {
+          console.log(`[poll]    ★ KIT ${o.order_number} line ${exp.lineIndex} (${exp.kitSku}) -> expanded to ${exp.dsCount} DS + ${exp.warehouseCount} warehouse components`);
+        }
       }
     }
+
+    // Advance watermark to (now - overlap window).
+    // Always advances with wall-clock time, regardless of order timestamps.
+    // The overlap ensures we never miss orders; re-fetches are harmless
+    // because upserts are idempotent.
+    const watermark = new Date(Date.now() - WATERMARK_OVERLAP_MS).toISOString();
+    await setSyncState(WATERMARK_KEY, watermark);
+    console.log(`[poll] Watermark: ${lastSync} -> ${watermark}`);
 
     // process unprocessed lines (from this batch and any previous)
     const lines = await getUnprocessedLines();
