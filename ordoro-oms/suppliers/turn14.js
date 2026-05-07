@@ -1,5 +1,6 @@
 import axios from "axios";
 import { withTimeout } from "../lib/timeout.js";
+import { rateLimit } from "../lib/rateLimit.js";
 import { getTurn14ById, getTurn14ByMpn } from "../db.js";
 
 const BASE = process.env.TURN14_BASE_URL || "https://api.turn14.com/v1";
@@ -78,6 +79,7 @@ export async function getPrice(productId) {
 }
 
 export async function check(productId) {
+  await rateLimit("turn14");
   const [inv, price] = await Promise.all([
     checkInventory(productId),
     getPrice(productId),
@@ -90,17 +92,37 @@ export async function check(productId) {
 }
 
 export async function checkByMpn(mpn, mappedProductId = null) {
+  // 1. Try cached data first
   let row = null;
   if (mappedProductId) row = await getTurn14ById(mappedProductId);
   if (!row) row = await getTurn14ByMpn(mpn);
-  if (!row) return { supplier: "turn14", stock: 0, cost: 0, supplierId: null, cachedAt: null };
-  return {
-    supplier: "turn14",
-    stock: row.stock,
-    cost: Number(row.cost) || 0,
-    supplierId: row.product_id,
-    cachedAt: row.updated_at || null,
-  };
+  if (row) {
+    return {
+      supplier: "turn14",
+      stock: row.stock,
+      cost: Number(row.cost) || 0,
+      supplierId: row.product_id,
+      cachedAt: row.updated_at || null,
+    };
+  }
+
+  // 2. No cache — fall back to live API if we have a mapped product ID
+  if (mappedProductId) {
+    try {
+      const result = await check(mappedProductId);
+      return {
+        supplier: "turn14",
+        stock: result.stock,
+        cost: result.cost,
+        supplierId: mappedProductId,
+        cachedAt: null,
+      };
+    } catch (err) {
+      console.error(`  [turn14] live fallback failed for product ${mappedProductId}: ${err.message}`);
+    }
+  }
+
+  return { supplier: "turn14", stock: 0, cost: 0, supplierId: null, cachedAt: null };
 }
 
 export async function liveCheck(productId) {

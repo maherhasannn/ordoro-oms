@@ -1,6 +1,14 @@
 import nodemailer from "nodemailer";
+import { createClient } from "@supabase/supabase-js";
 
 let transporter = null;
+let supabase = null;
+
+function getSupabase() {
+  if (supabase) return supabase;
+  supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+  return supabase;
+}
 
 function getTransporter() {
   if (transporter) return transporter;
@@ -44,46 +52,70 @@ export async function sendAlert(subject, body) {
 }
 
 /**
- * Build and send an alert for an unfulfillable order line.
+ * Build and send an alert for an item that doesn't exist at any supplier.
+ * For kit components, includes all lines from the entire order.
  */
 export async function alertUnfulfillable(line, decision) {
   const isKitComponent = !!line.kit_parent_sku;
   const itemLabel = line.mpn || line.sku || "unknown";
+
   const subject = isKitComponent
-    ? `OMS Alert: Cannot fulfill kit component ${itemLabel} (Order #${line.order_id}, kit ${line.kit_parent_sku})`
-    : `OMS Alert: Cannot fulfill ${itemLabel} (Order #${line.order_id})`;
+    ? `OMS Alert: Item not found at any supplier — ${itemLabel} (Order #${line.order_id}, kit ${line.kit_parent_sku})`
+    : `OMS Alert: Item not found at any supplier — ${itemLabel} (Order #${line.order_id})`;
 
   const supplierBreakdown = (decision.allResults || [])
-    .map(
-      (r) =>
-        `  - ${r.supplier}: ${r.stock} in stock @ $${r.cost}/unit`
-    )
+    .map((r) => `  - ${r.supplier}: ${r.stock} in stock @ $${r.cost}/unit`)
     .join("\n");
 
-  const lines = [
+  const body = [
     `Order:    #${line.order_id}`,
   ];
 
   if (isKitComponent) {
-    lines.push(`Kit SKU:  ${line.kit_parent_sku}`);
-    lines.push(`Component SKU: ${line.sku || "N/A"}`);
+    body.push(`Kit SKU:  ${line.kit_parent_sku}`);
+    body.push(`Component SKU: ${line.sku || "N/A"}`);
   } else {
-    lines.push(`SKU:      ${line.sku || "N/A"}`);
+    body.push(`SKU:      ${line.sku || "N/A"}`);
   }
 
-  lines.push(
+  body.push(
     `MPN:      ${line.mpn || "N/A"}`,
     `Product:  ${line.product_name || "N/A"}`,
     `Qty needed: ${line.quantity}`,
-    `Min stock required: ${Math.max(line.quantity, 4)} (includes buffer of 4)`,
     ``,
     `Reason: ${decision.decision_reason}`,
     ``,
-    `Supplier inventory at time of check:`,
+    `Supplier check results:`,
     supplierBreakdown || "  (no suppliers checked)",
-    ``,
-    `Action required: manually source this item or wait for restock.`,
   );
 
-  await sendAlert(subject, lines.join("\n"));
+  // For kit components, include all lines from the order for full context
+  if (isKitComponent) {
+    try {
+      const sb = getSupabase();
+      const { data: orderLines } = await sb
+        .from("order_lines")
+        .select("sku, mpn, quantity, status, is_ds, chosen_supplier, supplier_cost, kit_parent_sku")
+        .eq("order_id", line.order_id)
+        .order("id", { ascending: true });
+
+      if (orderLines && orderLines.length > 0) {
+        body.push(``, `All lines in order #${line.order_id}:`);
+        for (const ol of orderLines) {
+          const supplier = ol.chosen_supplier
+            ? `${ol.chosen_supplier} @ $${ol.supplier_cost}`
+            : "(none)";
+          body.push(
+            `  - ${ol.sku} (mpn=${ol.mpn}) qty=${ol.quantity} ds=${ol.is_ds} status=${ol.status} supplier=${supplier}`
+          );
+        }
+      }
+    } catch (err) {
+      body.push(``, `(failed to fetch full order lines: ${err.message})`);
+    }
+  }
+
+  body.push(``, `Action required: manually source this item or check product mapping.`);
+
+  await sendAlert(subject, body.join("\n"));
 }

@@ -21,6 +21,12 @@ import * as meyer from "./suppliers/meyer.js";
 import { selectBestDeal } from "./lib/bestDeal.js";
 import { alertUnfulfillable } from "./lib/notify.js";
 
+// ── Helpers ─────────────────────────────────────────────
+
+function toPST(iso) {
+  return new Date(iso).toLocaleString("en-US", { timeZone: "America/Los_Angeles" });
+}
+
 // ── Config ──────────────────────────────────────────────
 
 const POLL_INTERVAL = 180_000; // 3 minutes
@@ -47,7 +53,7 @@ async function fetchKitComponents(sku) {
     `ordoro product ${sku}`
   );
   const components = res.data.kit_components || [];
-  return components.map((c) => ({ componentSku: c.sku, quantity: c.quantity }));
+  return components.map((c) => ({ componentSku: c.sku, quantity: c.quantity, isKitParent: c.is_kit_parent === true }));
 }
 
 // ── Ordoro Polling ──────────────────────────────────────
@@ -106,9 +112,6 @@ async function processLine(line) {
     return;
   }
 
-  const MIN_STOCK_BUFFER = 4;
-  const minStock = Math.max(line.quantity, MIN_STOCK_BUFFER);
-
   // 1. Look up product_map for supplier-specific IDs (handles MPN mismatches)
   const mapping = await lookupProductMap(line.mpn);
 
@@ -128,16 +131,14 @@ async function processLine(line) {
     return;
   }
 
-  // 3. Pick best deal (initial selection based on cached/first-pass data)
+  // 3. Pick best deal (cheapest supplier with a known cost — stock is informational)
   const decision = selectBestDeal(results, line.quantity);
 
-  // 4. Live verification — confirm stock in real-time before committing
-  // Include any supplier with enough stock (even if cached cost is missing,
-  // e.g. Turn14 bulk sync doesn't fetch per-item pricing). Known-cost
-  // suppliers sort first; unknown-cost ones go last as fallbacks whose
-  // cost will be resolved by the live check.
+  // 4. Live verification — try to confirm cost/stock via live API
+  // Include any supplier with a supplierId (not filtered by stock).
+  // Sorted by cost so cheapest is tried first.
   const candidates = results
-    .filter((r) => r.stock >= minStock && r.supplierId)
+    .filter((r) => r.supplierId)
     .sort((a, b) => (a.cost || Infinity) - (b.cost || Infinity));
 
   if (candidates.length > 0) {
@@ -147,7 +148,7 @@ async function processLine(line) {
       const liveResult = await liveCheckFn(candidate.supplierId);
 
       if (liveResult.status === "no_api") {
-        // No live API (e.g., eKeystone) — need both a cached cost and fresh cache
+        // No live API (e.g., eKeystone) — need a cached cost and fresh cache
         if (!candidate.cost || candidate.cost <= 0) {
           console.log(`  ${tag} -> ${candidate.supplier} has no live API and no cached cost, skipping`);
           continue;
@@ -162,41 +163,35 @@ async function processLine(line) {
           continue;
         }
 
-        console.log(`  ${tag} -> verified ${candidate.supplier} (no live API, using cached: ${candidate.stock} in stock)`);
+        console.log(`  ${tag} -> verified ${candidate.supplier} (no live API, cached: stock ${candidate.stock}, cost $${candidate.cost})`);
         decision.chosen_supplier = candidate.supplier;
         decision.supplier_cost = candidate.cost;
         decision.supplier_stock = candidate.stock;
-        decision.decision_reason = `cheapest with ${minStock}+ stock (cached, no live API)`;
+        decision.decision_reason = `cheapest (cached, no live API)`;
         verified = true;
         break;
       }
 
       if (liveResult.status === "error") {
-        // API failed — do NOT trust cache, skip supplier
         console.error(`  [${candidate.supplier}] live check failed: ${liveResult.error}, skipping`);
         continue;
       }
 
-      // status === "ok" — verify stock and resolve cost
-      if (liveResult.stock >= minStock) {
-        const liveCost = liveResult.cost || candidate.cost;
-        if (!liveCost || liveCost <= 0) {
-          console.log(`  ${tag} -> ${candidate.supplier} live verified stock but no cost available, skipping`);
-          continue;
-        }
-        console.log(`  ${tag} -> live verified ${candidate.supplier} (live stock: ${liveResult.stock}, cost: $${liveCost})`);
-        decision.chosen_supplier = candidate.supplier;
-        decision.supplier_cost = liveCost;
-        decision.supplier_stock = liveResult.stock;
-        decision.decision_reason = `cheapest with ${minStock}+ stock (live verified)`;
-        verified = true;
-        break;
-      } else {
-        console.log(`  ${tag} -> ${candidate.supplier} failed live check (stock: ${liveResult.stock}, need ${minStock}+)`);
+      // status === "ok" — use live data
+      const liveCost = liveResult.cost || candidate.cost;
+      if (!liveCost || liveCost <= 0) {
+        console.log(`  ${tag} -> ${candidate.supplier} live verified but no cost available, skipping`);
+        continue;
       }
+      console.log(`  ${tag} -> live verified ${candidate.supplier} (stock: ${liveResult.stock}, cost: $${liveCost})`);
+      decision.chosen_supplier = candidate.supplier;
+      decision.supplier_cost = liveCost;
+      decision.supplier_stock = liveResult.stock;
+      decision.decision_reason = `cheapest (live verified)`;
+      verified = true;
+      break;
     }
 
-    // all candidates failed live verification
     if (!verified) {
       const detail = candidates
         .map((r) => `${r.supplier}: cached ${r.stock} in stock`)
@@ -204,20 +199,20 @@ async function processLine(line) {
       decision.chosen_supplier = null;
       decision.supplier_cost = null;
       decision.supplier_stock = null;
-      decision.decision_reason = `all suppliers failed live verification (need ${minStock}+): ${detail}`;
+      decision.decision_reason = `all suppliers failed live verification: ${detail}`;
     }
   }
 
   // 5. Log the final decision
   if (decision.chosen_supplier) {
     console.log(
-      `  ${tag} -> would be fulfilled by ${decision.chosen_supplier} ` +
+      `  ${tag} -> ${decision.chosen_supplier} ` +
         `at $${decision.supplier_cost}/unit (stock: ${decision.supplier_stock}) ` +
         `[${decision.decision_reason}]`
     );
   } else {
     console.log(`  ${tag} -> ${decision.decision_reason}`);
-    // send email alert for unfulfillable lines
+    // alert only when the item truly doesn't exist at any supplier
     await alertUnfulfillable(line, decision);
   }
 
@@ -245,7 +240,7 @@ async function pollCycle() {
       (await getSyncState(WATERMARK_KEY)) ||
       new Date(Date.now() - 5 * 60 * 1000).toISOString();
 
-    console.log(`\n[poll] Polling since: ${lastSync}`);
+    console.log(`\n[poll] Polling since: ${toPST(lastSync)}`);
 
     // fetch orders from Ordoro
     const orders = await fetchOrders(lastSync);
@@ -262,7 +257,7 @@ async function pollCycle() {
         const isDs = tags.includes("Contains DS Items");
         const tagStr = tags.length > 0 ? tags.join(", ") : "(none)";
         const updatedAt = o.updated_at || o.created_date;
-        console.log(`[poll]  ${isDs ? "★ DS" : "    "} ${o.order_number} [tags: ${tagStr}] updated=${updatedAt}`);
+        console.log(`[poll]  ${isDs ? "★ DS" : "    "} ${o.order_number} [tags: ${tagStr}] updated=${toPST(updatedAt)}`);
         for (const exp of kitExpansions) {
           console.log(`[poll]    ★ KIT ${o.order_number} line ${exp.lineIndex} (${exp.kitSku}) -> expanded to ${exp.dsCount} DS + ${exp.warehouseCount} warehouse components`);
         }
@@ -275,7 +270,7 @@ async function pollCycle() {
     // because upserts are idempotent.
     const watermark = new Date(Date.now() - WATERMARK_OVERLAP_MS).toISOString();
     await setSyncState(WATERMARK_KEY, watermark);
-    console.log(`[poll] Watermark: ${lastSync} -> ${watermark}`);
+    console.log(`[poll] Watermark: ${toPST(lastSync)} -> ${toPST(watermark)}`);
 
     // process unprocessed lines (from this batch and any previous)
     const lines = await getUnprocessedLines();

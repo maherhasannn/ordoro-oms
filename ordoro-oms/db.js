@@ -68,11 +68,33 @@ export async function upsertOrder(order, fetchKitComponents) {
       try {
         components = await fetchKitComponents(sku);
       } catch (err) {
-        console.error(`[kit] Failed to fetch kit_graph for ${sku}: ${err.message} — inserting parent line as fallback`);
+        console.error(`[kit] Failed to fetch components for ${sku}: ${err.message} — inserting parent line as fallback`);
         components = null;
       }
 
       if (components && components.length > 0) {
+        // Flatten nested kits: if a component is itself a kit parent,
+        // expand it recursively (one level deep — nested-nested kits are rare)
+        const flatComponents = [];
+        for (const comp of components) {
+          if (comp.isKitParent) {
+            try {
+              const subComps = await fetchKitComponents(comp.componentSku);
+              for (const sc of subComps) {
+                flatComponents.push({
+                  componentSku: sc.componentSku,
+                  quantity: (comp.quantity || 1) * (sc.quantity || 1),
+                });
+              }
+              console.log(`[kit] Expanded nested kit ${comp.componentSku} -> ${subComps.length} sub-components`);
+            } catch (err) {
+              console.error(`[kit] Failed to expand nested kit ${comp.componentSku}: ${err.message} — skipping`);
+            }
+          } else {
+            flatComponents.push(comp);
+          }
+        }
+
         // Check if we already expanded this kit (idempotency)
         const { data: existingComponents } = await supabase
           .from("order_lines")
@@ -91,8 +113,8 @@ export async function upsertOrder(order, fetchKitComponents) {
         const ordoroLineId = l.id != null ? String(l.id) : null;
         const now = new Date().toISOString();
 
-        for (let c = 0; c < components.length; c++) {
-          const comp = components[c];
+        for (let c = 0; c < flatComponents.length; c++) {
+          const comp = flatComponents[c];
           const compMpn = extractMpnFromSku(comp.componentSku);
           const compIsDs = await isComponentDropShip(compMpn);
           const compStatus = compIsDs ? "pending" : "manual";
@@ -128,9 +150,59 @@ export async function upsertOrder(order, fetchKitComponents) {
           warehouseCount,
         });
 
-        continue; // don't insert the parent kit line itself
+        // Insert (or update) the parent kit line itself — marked as "expanded"
+        // so it's preserved for traceability but not processed by the decision engine
+        const parentOrdoroLineId = l.id != null ? String(l.id) : null;
+        let existingParent = null;
+        if (parentOrdoroLineId) {
+          const { data } = await supabase
+            .from("order_lines")
+            .select("id, status")
+            .eq("order_id", order.order_number)
+            .eq("ordoro_line_id", parentOrdoroLineId)
+            .maybeSingle();
+          existingParent = data;
+        }
+        if (!existingParent) {
+          const { data } = await supabase
+            .from("order_lines")
+            .select("id, status")
+            .eq("order_id", order.order_number)
+            .eq("line_number", i)
+            .is("kit_parent_sku", null)
+            .eq("sku", sku)
+            .maybeSingle();
+          existingParent = data;
+        }
+
+        if (existingParent) {
+          // Update existing parent line to "expanded" if not already
+          if (existingParent.status !== "expanded") {
+            await supabase.from("order_lines")
+              .update({ status: "expanded", is_ds: false, updated_at: now })
+              .eq("id", existingParent.id);
+          }
+        } else {
+          // Insert new parent line as "expanded"
+          const parentMpn = l.product?.mpn || sku;
+          await supabase.from("order_lines").insert({
+            order_id: order.order_number,
+            line_number: i,
+            ordoro_line_id: parentOrdoroLineId,
+            sku,
+            mpn: parentMpn,
+            product_name: l.product_name || l.product?.name || null,
+            quantity: l.quantity || 1,
+            unit_price: l.unit_price ?? l.item_price ?? null,
+            status: "expanded",
+            is_ds: false,
+            updated_at: now,
+          });
+        }
+
+        continue; // skip the normal line insertion below
       }
-      // If kit_graph returned empty or failed, fall through to insert parent line
+      // If component fetch returned empty or failed, fall through to insert parent line
     }
 
     // ── Normal (non-kit) line ──────────────────────────
@@ -252,8 +324,8 @@ export async function updateOrderLineDecision(lineId, decision) {
     updated_at: now,
     status: decision.chosen_supplier ? "decided" : "failed",
   };
-  if (decision.chosen_supplier && decision.order_id != null && decision.line_number != null) {
-    update.idempotency_key = `${decision.order_id}_${decision.line_number}_${decision.chosen_supplier}`;
+  if (decision.chosen_supplier) {
+    update.idempotency_key = `${lineId}_${decision.chosen_supplier}`;
   }
   const { error } = await supabase
     .from("order_lines")

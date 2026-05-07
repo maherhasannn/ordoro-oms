@@ -3,6 +3,7 @@ import SftpClient from "ssh2-sftp-client";
 import { parse } from "csv-parse/sync";
 import { upsertMeyerInventory, getMeyerInventory, getMeyerByMpn } from "../db.js";
 import { withTimeout } from "../lib/timeout.js";
+import { rateLimit } from "../lib/rateLimit.js";
 
 const BASE =
   process.env.MEYER_API_URL ||
@@ -126,6 +127,7 @@ export async function syncFeed() {
 // ── REST API: Item Information (live check) ─────────────
 
 export async function getItemInfo(itemNumber, customerNumber) {
+  await rateLimit("meyer");
   const custNum = customerNumber || process.env.MEYER_CUSTOMER_NUMBER;
   const res = await withTimeout(
     axios.get(`${BASE}/ItemInformation`, {
@@ -163,17 +165,39 @@ export async function check(sku) {
 }
 
 export async function checkByMpn(mpn, mappedSku = null) {
+  // 1. Try cached data first
   let row = null;
   if (mappedSku) row = await getMeyerInventory(mappedSku);
   if (!row) row = await getMeyerByMpn(mpn);
-  if (!row) return { supplier: "meyer", stock: 0, cost: 0, supplierId: null, cachedAt: null };
-  return {
-    supplier: "meyer",
-    stock: row.stock,
-    cost: Number(row.cost) || 0,
-    supplierId: row.meyer_sku,
-    cachedAt: row.updated_at || null,
-  };
+  if (row) {
+    return {
+      supplier: "meyer",
+      stock: row.stock,
+      cost: Number(row.cost) || 0,
+      supplierId: row.meyer_sku,
+      cachedAt: row.updated_at || null,
+    };
+  }
+
+  // 2. No cache — fall back to live API if we have a mapped Meyer SKU
+  if (mappedSku) {
+    try {
+      const item = await getItemInfo(mappedSku);
+      if (item) {
+        return {
+          supplier: "meyer",
+          stock: Number(item.QtyAvailable ?? 0),
+          cost: Number(item.CustomerPrice ?? 0),
+          supplierId: mappedSku,
+          cachedAt: null,
+        };
+      }
+    } catch (err) {
+      console.error(`  [meyer] live fallback failed for SKU ${mappedSku}: ${err.message}`);
+    }
+  }
+
+  return { supplier: "meyer", stock: 0, cost: 0, supplierId: null, cachedAt: null };
 }
 
 // ── Live check (always hits REST API, bypasses cache) ──

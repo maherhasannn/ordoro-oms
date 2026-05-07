@@ -44,7 +44,7 @@ create table if not exists order_lines (
 
   -- state machine ('manual' = warehouse part, skip supplier matching)
   status           text not null default 'pending'
-    check (status in ('pending', 'decided', 'ordering', 'ordered', 'failed', 'manual')),
+    check (status in ('pending', 'decided', 'ordering', 'ordered', 'failed', 'manual', 'expanded')),
   external_order_id text,
   idempotency_key  text,
 
@@ -122,4 +122,4 @@ create table if not exists sync_state (
 -- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
 -- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS kit_parent_sku text;
 -- ALTER TABLE order_lines DROP CONSTRAINT IF EXISTS order_lines_status_check;
--- ALTER TABLE order_lines ADD CONSTRAINT order_lines_status_check CHECK (status IN ('pending', 'decided', 'ordering', 'ordered', 'failed', 'manual'));
+-- ALTER TABLE order_lines ADD CONSTRAINT order_lines_status_check CHECK (status IN ('pending', 'decided', 'ordering', 'ordered', 'failed', 'manual', 'expanded'));
