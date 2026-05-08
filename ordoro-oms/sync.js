@@ -153,6 +153,10 @@ async function processLine(line) {
           console.log(`  ${tag} -> ${candidate.supplier} has no live API and no cached cost, skipping`);
           continue;
         }
+        if (candidate.stock < line.quantity) {
+          console.log(`  ${tag} -> ${candidate.supplier} insufficient stock (have ${candidate.stock}, need ${line.quantity}), skipping`);
+          continue;
+        }
         const cacheAge = candidate.cachedAt
           ? Date.now() - new Date(candidate.cachedAt).getTime()
           : Infinity;
@@ -181,6 +185,10 @@ async function processLine(line) {
       const liveCost = liveResult.cost || candidate.cost;
       if (!liveCost || liveCost <= 0) {
         console.log(`  ${tag} -> ${candidate.supplier} live verified but no cost available, skipping`);
+        continue;
+      }
+      if (liveResult.stock < line.quantity) {
+        console.log(`  ${tag} -> ${candidate.supplier} live stock insufficient (have ${liveResult.stock}, need ${line.quantity}), skipping`);
         continue;
       }
       console.log(`  ${tag} -> live verified ${candidate.supplier} (stock: ${liveResult.stock}, cost: $${liveCost})`);

@@ -98,6 +98,10 @@ async function main() {
 
         if (liveResult.status === "no_api") {
           if (!candidate.cost || candidate.cost <= 0) continue;
+          if (candidate.stock < line.quantity) {
+            console.log(`  ${tag} -> ${candidate.supplier} insufficient stock (have ${candidate.stock}, need ${line.quantity}), skipping`);
+            continue;
+          }
           decision.chosen_supplier = candidate.supplier;
           decision.supplier_cost = candidate.cost;
           decision.supplier_stock = candidate.stock;
@@ -109,6 +113,10 @@ async function main() {
 
         const liveCost = liveResult.cost || candidate.cost;
         if (!liveCost || liveCost <= 0) continue;
+        if (liveResult.stock < line.quantity) {
+          console.log(`  ${tag} -> ${candidate.supplier} live stock insufficient (have ${liveResult.stock}, need ${line.quantity}), skipping`);
+          continue;
+        }
         decision.chosen_supplier = candidate.supplier;
         decision.supplier_cost = liveCost;
         decision.supplier_stock = liveResult.stock;
