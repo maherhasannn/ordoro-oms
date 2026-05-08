@@ -21,7 +21,6 @@ const auth = Buffer.from(`${process.env.ORDORO_CLIENT}:${process.env.ORDORO_SECR
 const ordoroHeaders = { Authorization: `Basic ${auth}` };
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-const MIN_STOCK_BUFFER = 4;
 const LIVE_CHECK_FN = { turn14: turn14.liveCheck, meyer: meyer.liveCheck, ekeystone: ekeystone.liveCheck };
 
 async function fetchKitComponents(sku) {
@@ -261,12 +260,11 @@ async function main() {
       continue;
     }
 
-    const minStock = Math.max(line.quantity, MIN_STOCK_BUFFER);
     const decision = selectBestDeal(results, line.quantity);
 
     // Live verification
     const candidates = results
-      .filter((r) => r.stock >= minStock && r.supplierId)
+      .filter((r) => r.stock >= line.quantity && r.supplierId)
       .sort((a, b) => (a.cost || Infinity) - (b.cost || Infinity));
 
     if (candidates.length > 0) {
@@ -280,18 +278,18 @@ async function main() {
           decision.chosen_supplier = candidate.supplier;
           decision.supplier_cost = candidate.cost;
           decision.supplier_stock = candidate.stock;
-          decision.decision_reason = `cheapest with ${minStock}+ stock (cached, no live API)`;
+          decision.decision_reason = `cheapest (cached, no live API)`;
           verified = true;
           break;
         }
         if (liveResult.status === "error") continue;
-        if (liveResult.stock >= minStock) {
+        if (liveResult.stock >= line.quantity) {
           const liveCost = liveResult.cost || candidate.cost;
           if (!liveCost || liveCost <= 0) continue;
           decision.chosen_supplier = candidate.supplier;
           decision.supplier_cost = liveCost;
           decision.supplier_stock = liveResult.stock;
-          decision.decision_reason = `cheapest with ${minStock}+ stock (live verified)`;
+          decision.decision_reason = `cheapest (live verified)`;
           verified = true;
           break;
         }
@@ -300,7 +298,7 @@ async function main() {
         decision.chosen_supplier = null;
         decision.supplier_cost = null;
         decision.supplier_stock = null;
-        decision.decision_reason = `all suppliers failed live verification (need ${minStock}+)`;
+        decision.decision_reason = `all suppliers failed live verification`;
       }
     }
 
