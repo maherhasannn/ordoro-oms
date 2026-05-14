@@ -9,6 +9,37 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+const MANUAL_SHIP_SKU_PREFIXES = ["JCO", "MXT"];
+export const MANUAL_SHIP_DECISION_REASON =
+  "manual shipment required for JCO/MXT SKU prefix";
+
+export function isManualShipSku(sku) {
+  if (!sku) return false;
+  const normalized = String(sku).trim().toUpperCase();
+  return MANUAL_SHIP_SKU_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
+function getManualShipUpdate(now = new Date().toISOString()) {
+  return {
+    status: "manual",
+    chosen_supplier: null,
+    supplier_cost: null,
+    supplier_stock: null,
+    decided_at: null,
+    decision_reason: MANUAL_SHIP_DECISION_REASON,
+    idempotency_key: null,
+    updated_at: now,
+  };
+}
+
+export async function markLineManualShip(lineId) {
+  const { error } = await supabase
+    .from("order_lines")
+    .update(getManualShipUpdate())
+    .eq("id", lineId);
+  if (error) throw error;
+}
+
 // ── Kit Helpers ──────────────────────────────────────────
 
 /**
@@ -121,9 +152,10 @@ export async function upsertOrder(order, fetchKitComponents) {
           const isInsert = /^I-/i.test(comp.componentSku);
           const compMpn = extractMpnFromSku(comp.componentSku);
           const compIsDs = isInsert ? false : await isComponentDropShip(compMpn);
-          const compStatus = compIsDs ? "pending" : "manual";
+          const compIsManualShip = isManualShipSku(comp.componentSku);
+          const compStatus = compIsDs && !compIsManualShip ? "pending" : "manual";
 
-          if (compIsDs) dsCount++;
+          if (compStatus === "pending") dsCount++;
           else warehouseCount++;
 
           const compOrdoroLineId = ordoroLineId
@@ -141,6 +173,7 @@ export async function upsertOrder(order, fetchKitComponents) {
             unit_price: null, // kit components don't have individual prices from Ordoro
             status: compStatus,
             is_ds: compIsDs,
+            decision_reason: compIsManualShip ? MANUAL_SHIP_DECISION_REASON : null,
             kit_parent_sku: sku,
             updated_at: now,
           });
@@ -221,6 +254,7 @@ export async function upsertOrder(order, fetchKitComponents) {
       : l.shippability?.is_dropship === true ||
         lineTags.includes("Drop Ship") ||
         lineTags.includes("DS");
+    const lineIsManualShip = isManualShipSku(sku);
 
     // Fix: use Ordoro's line item ID for stable identity (array index is fragile)
     const ordoroLineId = l.id != null ? String(l.id) : null;
@@ -260,6 +294,9 @@ export async function upsertOrder(order, fetchKitComponents) {
           is_ds: lineIsDs,
           updated_at: now,
         };
+        if (lineIsManualShip) {
+          Object.assign(updateFields, getManualShipUpdate(now));
+        }
         // Backfill ordoro_line_id on legacy rows
         if (!existing.ordoro_line_id && ordoroLineId) {
           updateFields.ordoro_line_id = ordoroLineId;
@@ -280,8 +317,9 @@ export async function upsertOrder(order, fetchKitComponents) {
         product_name: l.product_name || l.product?.name || null,
         quantity: l.quantity || 1,
         unit_price: l.unit_price ?? l.item_price ?? null,
-        status: "pending",
+        status: lineIsManualShip ? "manual" : "pending",
         is_ds: lineIsDs,
+        decision_reason: lineIsManualShip ? MANUAL_SHIP_DECISION_REASON : null,
         updated_at: now,
       });
       if (lineErr) throw lineErr;

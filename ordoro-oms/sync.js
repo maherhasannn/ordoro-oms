@@ -13,6 +13,8 @@ import {
   getRetryableFailedLines,
   resetLineForRetry,
   lookupProductMap,
+  isManualShipSku,
+  markLineManualShip,
 } from "./db.js";
 import { withTimeout } from "./lib/timeout.js";
 import * as turn14 from "./suppliers/turn14.js";
@@ -109,6 +111,12 @@ async function processLine(line) {
 
   if (line.status !== "pending") {
     console.log(`  ${tag} — skipping (status: ${line.status})`);
+    return;
+  }
+
+  if (isManualShipSku(line.sku)) {
+    console.log(`  ${tag} — manual shipment required, skipping supplier processing`);
+    await markLineManualShip(line.id);
     return;
   }
 
