@@ -1,7 +1,5 @@
-import nodemailer from "nodemailer";
 import { createClient } from "@supabase/supabase-js";
 
-let transporter = null;
 let supabase = null;
 
 function getSupabase() {
@@ -10,42 +8,32 @@ function getSupabase() {
   return supabase;
 }
 
-function getTransporter() {
-  if (transporter) return transporter;
-  if (!process.env.SMTP_HOST) return null;
-
-  transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT) || 587,
-    secure: process.env.SMTP_SECURE === "true",
-    family: 4,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-  });
-  return transporter;
-}
-
-/**
- * Send an alert email. Falls back to console.warn if SMTP is not configured.
- */
 export async function sendAlert(subject, body) {
-  const t = getTransporter();
-  if (!t || !process.env.ALERT_EMAIL_TO) {
-    console.warn(`[alert] (no SMTP) ${subject}`);
+  if (!process.env.SMTP2GO_API_KEY || !process.env.ALERT_EMAIL_TO) {
+    console.warn(`[alert] (no SMTP2GO key) ${subject}`);
     console.warn(body);
     return;
   }
 
   try {
-    await t.sendMail({
-      from: process.env.ALERT_EMAIL_FROM || process.env.SMTP_USER,
-      to: process.env.ALERT_EMAIL_TO,
-      subject,
-      text: body,
+    const res = await fetch("https://api.smtp2go.com/v3/email/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: process.env.SMTP2GO_API_KEY,
+        sender: process.env.ALERT_EMAIL_FROM,
+        to: [process.env.ALERT_EMAIL_TO],
+        subject,
+        text_body: body,
+      }),
     });
-    console.log(`[alert] Email sent: ${subject}`);
+    const data = await res.json();
+    if (data.data?.succeeded > 0) {
+      console.log(`[alert] Email sent: ${subject}`);
+    } else {
+      console.error(`[alert] Email failed:`, data);
+      console.warn(body);
+    }
   } catch (err) {
     console.error(`[alert] Email failed: ${err.message}`);
     console.warn(body);
