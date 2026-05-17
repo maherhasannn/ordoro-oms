@@ -22,7 +22,7 @@ export async function sendAlert(subject, body) {
       body: JSON.stringify({
         api_key: process.env.SMTP2GO_API_KEY,
         sender: process.env.ALERT_EMAIL_FROM,
-        to: [process.env.ALERT_EMAIL_TO],
+        to: process.env.ALERT_EMAIL_TO.split(",").map(e => e.trim()),
         subject,
         text_body: body,
       }),
