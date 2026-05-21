@@ -19,6 +19,11 @@ export function isManualShipSku(sku) {
   return MANUAL_SHIP_SKU_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
+export function isInstructionSku(sku) {
+  if (!sku) return false;
+  return /^I-/i.test(String(sku).trim());
+}
+
 function getManualShipUpdate(now = new Date().toISOString()) {
   return {
     status: "manual",
@@ -363,6 +368,7 @@ export async function updateOrderLineDecision(lineId, decision) {
     chosen_supplier: decision.chosen_supplier || null,
     supplier_cost: decision.supplier_cost ?? null,
     supplier_stock: decision.supplier_stock ?? null,
+    supplier_product_id: decision.supplier_product_id || null,
     decision_reason: decision.decision_reason || null,
     decided_at: now,
     updated_at: now,
@@ -534,12 +540,14 @@ export async function claimLineForOrdering(lineId) {
  * Mark a line as ordered (ordering → ordered).
  */
 export async function markLineOrdered(lineId, externalOrderId) {
+  const now = new Date().toISOString();
   const { error } = await supabase
     .from("order_lines")
     .update({
       status: "ordered",
       external_order_id: externalOrderId || null,
-      updated_at: new Date().toISOString(),
+      ordered_at: now,
+      updated_at: now,
     })
     .eq("id", lineId)
     .eq("status", "ordering");
@@ -560,8 +568,11 @@ export async function markLineFailed(lineId, reason, retry = false) {
     update.chosen_supplier = null;
     update.supplier_cost = null;
     update.supplier_stock = null;
+    update.supplier_product_id = null;
     update.decided_at = null;
     update.idempotency_key = null;
+    update.supplier_order_id = null;
+    update.supplier_po_number = null;
   }
   const { error } = await supabase
     .from("order_lines")
@@ -618,13 +629,197 @@ export async function resetLineForRetry(lineId, currentRetryCount) {
       chosen_supplier: null,
       supplier_cost: null,
       supplier_stock: null,
+      supplier_product_id: null,
       decided_at: null,
       idempotency_key: null,
+      supplier_order_id: null,
+      supplier_po_number: null,
       retry_count: (currentRetryCount || 0) + 1,
       updated_at: new Date().toISOString(),
     })
     .eq("id", lineId)
     .eq("status", "failed"); // optimistic lock
+  if (error) throw error;
+}
+
+// ── Order Placement ─────────────────────────────────────
+
+export async function getDecidedLinesGrouped() {
+  const { data, error } = await supabase
+    .from("order_lines")
+    .select("*")
+    .eq("status", "decided")
+    .eq("is_ds", true)
+    .order("order_id", { ascending: true });
+  if (error) throw error;
+
+  const groups = new Map();
+  for (const line of data || []) {
+    const key = `${line.order_id}__${line.chosen_supplier}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(line);
+  }
+  return groups;
+}
+
+export async function getOrderShippingAddress(orderId) {
+  const { data, error } = await supabase
+    .from("orders")
+    .select("shipping_address")
+    .eq("id", orderId)
+    .single();
+  if (error) throw error;
+  return data?.shipping_address || null;
+}
+
+export async function createSupplierOrder({ orderId, supplier, poNumber, shippingAddress, items, totalCost }) {
+  const { data, error } = await supabase
+    .from("supplier_orders")
+    .insert({
+      order_id: orderId,
+      supplier,
+      po_number: poNumber,
+      shipping_address: shippingAddress,
+      items,
+      total_cost: totalCost,
+      status: "pending",
+    })
+    .select("id")
+    .single();
+  if (error) throw error;
+  return data.id;
+}
+
+export async function linkLinesToSupplierOrder(lineIds, supplierOrderId, poNumber) {
+  const { error } = await supabase
+    .from("order_lines")
+    .update({
+      supplier_order_id: supplierOrderId,
+      supplier_po_number: poNumber,
+      updated_at: new Date().toISOString(),
+    })
+    .in("id", lineIds);
+  if (error) throw error;
+}
+
+export async function markSupplierOrderPlaced(supplierOrderId, externalOrderId, quoteId = null) {
+  const { error } = await supabase
+    .from("supplier_orders")
+    .update({
+      status: "placed",
+      external_order_id: externalOrderId,
+      quote_id: quoteId,
+      placed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", supplierOrderId);
+  if (error) throw error;
+}
+
+export async function markSupplierOrderFailed(supplierOrderId, errorMessage) {
+  const { error } = await supabase
+    .from("supplier_orders")
+    .update({
+      status: "failed",
+      error_message: errorMessage,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", supplierOrderId);
+  if (error) throw error;
+}
+
+export async function existingSupplierOrder(orderId, supplier) {
+  const { data, error } = await supabase
+    .from("supplier_orders")
+    .select("id, po_number, status")
+    .eq("order_id", orderId)
+    .eq("supplier", supplier)
+    .neq("status", "failed")
+    .neq("status", "cancelled")
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+// ── Tracking ────────────────────────────────────────────
+
+export async function getOrdersAwaitingTracking() {
+  const { data, error } = await supabase
+    .from("supplier_orders")
+    .select("*")
+    .in("status", ["placed", "partially_shipped"])
+    .order("placed_at", { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+export async function getLinesForSupplierOrder(supplierOrderId) {
+  const { data, error } = await supabase
+    .from("order_lines")
+    .select("*")
+    .eq("supplier_order_id", supplierOrderId);
+  if (error) throw error;
+  return data || [];
+}
+
+export async function updateLineTracking(lineId, { trackingNumber, trackingCarrier }) {
+  const { error } = await supabase
+    .from("order_lines")
+    .update({
+      status: "shipped",
+      tracking_number: trackingNumber,
+      tracking_carrier: trackingCarrier,
+      shipped_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", lineId);
+  if (error) throw error;
+}
+
+export async function markSupplierOrderShipped(supplierOrderId) {
+  const { error } = await supabase
+    .from("supplier_orders")
+    .update({
+      status: "shipped",
+      shipped_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", supplierOrderId);
+  if (error) throw error;
+}
+
+export async function markSupplierOrderPartiallyShipped(supplierOrderId) {
+  const { error } = await supabase
+    .from("supplier_orders")
+    .update({
+      status: "partially_shipped",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", supplierOrderId);
+  if (error) throw error;
+}
+
+// ── Ordoro Sync-back ────────────────────────────────────
+
+export async function getUnSyncedShippedLines() {
+  const { data, error } = await supabase
+    .from("order_lines")
+    .select("*")
+    .eq("status", "shipped")
+    .eq("tracking_synced_to_ordoro", false)
+    .not("tracking_number", "is", null);
+  if (error) throw error;
+  return data || [];
+}
+
+export async function markTrackingSyncedToOrdoro(lineId) {
+  const { error } = await supabase
+    .from("order_lines")
+    .update({
+      tracking_synced_to_ordoro: true,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", lineId);
   if (error) throw error;
 }
 

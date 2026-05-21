@@ -133,3 +133,99 @@ export async function liveCheck(productId) {
     return { status: "error", error: err.message };
   }
 }
+
+// ── Order Placement ────────────────────────────────────
+
+const TURN14_ORDER_TIMEOUT = 30_000;
+
+async function apiPost(path, body, retried = false) {
+  try {
+    const headers = await authHeaders(retried);
+    headers["Content-Type"] = "application/json";
+    const res = await withTimeout(
+      axios.post(`${BASE}${path}`, body, { headers }),
+      TURN14_ORDER_TIMEOUT,
+      `turn14 POST ${path}`
+    );
+    return res.data;
+  } catch (err) {
+    if (err.response?.status === 401 && !retried) {
+      return apiPost(path, body, true);
+    }
+    throw err;
+  }
+}
+
+export async function placeOrder({ poNumber, items, shippingAddress }) {
+  await rateLimit("turn14");
+
+  // Step 1: create a quote
+  const quotePayload = {
+    po_number: poNumber,
+    shipping_address: shippingAddress,
+    line_items: items.map((i) => ({
+      item_identifier: i.supplierId,
+      quantity: i.quantity,
+    })),
+    prop_65_acknowledge: true,
+  };
+
+  const quoteRes = await apiPost("/quote", quotePayload);
+  const quoteId = quoteRes?.data?.id || quoteRes?.quote_id;
+  if (!quoteId) {
+    throw new Error(`Turn14 quote response missing quote_id: ${JSON.stringify(quoteRes)}`);
+  }
+
+  // Pick the first (cheapest) shipping option from the first segment
+  const segments = quoteRes?.data?.attributes?.segments || quoteRes?.segments || [];
+  let shippingId = null;
+  for (const seg of segments) {
+    const options = seg.shipping_options || seg.shipping_methods || [];
+    if (options.length > 0) {
+      shippingId = options[0].id || options[0].shipping_id;
+      break;
+    }
+  }
+
+  await rateLimit("turn14");
+
+  // Step 2: place order from quote
+  const orderPayload = {
+    quote_id: quoteId,
+    po_number: poNumber,
+    shipping_id: shippingId,
+    prop_65_acknowledge: true,
+    epa_acknowledge: true,
+  };
+
+  const orderRes = await apiPost("/order/from_quote", orderPayload);
+  const externalOrderId =
+    orderRes?.data?.id || orderRes?.order_id || orderRes?.data?.attributes?.order_id;
+
+  return {
+    externalOrderId: String(externalOrderId || quoteId),
+    quoteId: String(quoteId),
+  };
+}
+
+// ── Tracking ───────────────────────────────────────────
+
+export async function getTracking(externalOrderId) {
+  try {
+    await rateLimit("turn14");
+    const data = await apiGet(`/tracking/package_details?order_id=${externalOrderId}`);
+    const packages = data?.data || [];
+    if (packages.length === 0) return null;
+
+    const pkg = packages[0];
+    const attrs = pkg.attributes || pkg;
+    return {
+      trackingNumber: attrs.tracking_number || null,
+      carrier: attrs.shipping_provider || attrs.carrier || null,
+      status: attrs.delivery_status || attrs.status || null,
+    };
+  } catch (err) {
+    if (err.response?.status === 404) return null;
+    throw err;
+  }
+}

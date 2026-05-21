@@ -14,14 +14,36 @@ import {
   resetLineForRetry,
   lookupProductMap,
   isManualShipSku,
+  isInstructionSku,
   markLineManualShip,
+  claimLineForOrdering,
+  markLineOrdered,
+  getDecidedLinesGrouped,
+  getOrderShippingAddress,
+  createSupplierOrder,
+  linkLinesToSupplierOrder,
+  markSupplierOrderPlaced,
+  markSupplierOrderFailed,
+  existingSupplierOrder,
+  getOrdersAwaitingTracking,
+  getLinesForSupplierOrder,
+  updateLineTracking,
+  markSupplierOrderShipped,
+  markSupplierOrderPartiallyShipped,
+  getUnSyncedShippedLines,
+  markTrackingSyncedToOrdoro,
 } from "./db.js";
 import { withTimeout } from "./lib/timeout.js";
 import * as turn14 from "./suppliers/turn14.js";
 import * as ekeystone from "./suppliers/ekeystone.js";
 import * as meyer from "./suppliers/meyer.js";
 import { selectBestDeal } from "./lib/bestDeal.js";
-import { alertUnfulfillable } from "./lib/notify.js";
+import { alertUnfulfillable, alertOrderPlacementFailed } from "./lib/notify.js";
+import {
+  mapAddressForTurn14,
+  mapAddressForEkeystone,
+  mapAddressForMeyer,
+} from "./lib/addressMapper.js";
 
 // ── Helpers ─────────────────────────────────────────────
 
@@ -35,6 +57,8 @@ const POLL_INTERVAL = 180_000; // 3 minutes
 const MAX_CACHE_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours — reject eKeystone cache older than this
 const EKEYSTONE_SYNC_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours (feed updates daily)
 const MEYER_SYNC_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours (Meyer pushes periodically)
+const TRACKING_POLL_INTERVAL = 3_600_000; // 60 minutes
+const ORDORO_SYNC_INTERVAL = 300_000; // 5 minutes
 const WATERMARK_KEY = "ordoro_last_sync";
 const ORDORO_API_TIMEOUT = 15_000;
 const WATERMARK_OVERLAP_MS = 30_000;
@@ -120,6 +144,12 @@ async function processLine(line) {
     return;
   }
 
+  if (isInstructionSku(line.sku)) {
+    console.log(`  ${tag} — instruction code (I- prefix), skipping supplier processing`);
+    await markLineManualShip(line.id);
+    return;
+  }
+
   // 1. Look up product_map for supplier-specific IDs (handles MPN mismatches)
   const mapping = await lookupProductMap(line.mpn);
 
@@ -179,6 +209,7 @@ async function processLine(line) {
         decision.chosen_supplier = candidate.supplier;
         decision.supplier_cost = candidate.cost;
         decision.supplier_stock = candidate.stock;
+        decision.supplier_product_id = candidate.supplierId;
         decision.decision_reason = `cheapest (cached, no live API)`;
         verified = true;
         break;
@@ -203,6 +234,7 @@ async function processLine(line) {
       decision.chosen_supplier = candidate.supplier;
       decision.supplier_cost = liveCost;
       decision.supplier_stock = liveResult.stock;
+      decision.supplier_product_id = candidate.supplierId;
       decision.decision_reason = `cheapest (live verified)`;
       verified = true;
       break;
@@ -309,10 +341,279 @@ async function pollCycle() {
     } catch (retryErr) {
       console.error("[retry] Error checking retryable lines:", retryErr.message);
     }
+
+    // place orders for decided lines
+    try {
+      await placeOrders();
+    } catch (orderErr) {
+      console.error("[order] Error in placeOrders:", orderErr.message);
+    }
   } catch (err) {
     console.error("[poll] Top-level error:", err.message);
   } finally {
     pollRunning = false;
+  }
+}
+
+// ── Order Placement ─────────────────────────────────────
+
+const SUPPLIER_PLACE_FN = {
+  turn14: turn14.placeOrder,
+  ekeystone: ekeystone.placeOrder,
+  meyer: meyer.placeOrder,
+};
+
+const ADDRESS_MAP_FN = {
+  turn14: mapAddressForTurn14,
+  ekeystone: mapAddressForEkeystone,
+  meyer: mapAddressForMeyer,
+};
+
+function isTransientError(err) {
+  if (["ECONNRESET", "ETIMEDOUT", "ENOTFOUND"].includes(err.code)) return true;
+  if ([429, 500, 502, 503, 504].includes(err.response?.status)) return true;
+  if (err.message?.includes("timed out")) return true;
+  return false;
+}
+
+async function placeOrders() {
+  if (process.env.ORDER_PLACEMENT_ENABLED !== "true") return;
+
+  const groups = await getDecidedLinesGrouped();
+  if (groups.size === 0) return;
+
+  console.log(`[order] ${groups.size} batch(es) ready to place`);
+
+  for (const [key, lines] of groups) {
+    const [orderId, supplier] = key.split("__");
+    const tag = `Order #${orderId} -> ${supplier} (${lines.length} items)`;
+
+    try {
+      // idempotency: skip if a non-failed supplier_order already exists
+      const existing = await existingSupplierOrder(orderId, supplier);
+      if (existing) {
+        console.log(`  ${tag} — already has PO ${existing.po_number}, skipping`);
+        continue;
+      }
+
+      // claim all lines atomically (decided -> ordering)
+      const claims = await Promise.all(lines.map((l) => claimLineForOrdering(l.id)));
+      if (claims.some((c) => !c)) {
+        console.log(`  ${tag} — some lines already claimed, skipping`);
+        continue;
+      }
+
+      // get shipping address
+      const shippingAddress = await getOrderShippingAddress(orderId);
+      if (!shippingAddress) {
+        throw new Error("No shipping address found for order");
+      }
+
+      // generate PO number
+      const poNumber = `OMS-${orderId}-${supplier}-${Math.floor(Date.now() / 1000)}`;
+
+      // build items array
+      const items = lines.map((l) => ({
+        lineId: l.id,
+        sku: l.sku,
+        mpn: l.mpn,
+        supplierId: l.supplier_product_id,
+        quantity: l.quantity,
+        cost: l.supplier_cost,
+      }));
+
+      const totalCost = items.reduce((s, i) => s + (i.cost || 0) * i.quantity, 0);
+
+      // create supplier_orders row
+      const supplierOrderId = await createSupplierOrder({
+        orderId,
+        supplier,
+        poNumber,
+        shippingAddress,
+        items,
+        totalCost,
+      });
+
+      // link lines to supplier order
+      await linkLinesToSupplierOrder(
+        lines.map((l) => l.id),
+        supplierOrderId,
+        poNumber
+      );
+
+      // map address to supplier format
+      const mappedAddress = ADDRESS_MAP_FN[supplier](shippingAddress);
+
+      if (process.env.DRY_RUN === "true") {
+        console.log(`  ${tag} — DRY RUN (PO: ${poNumber}), skipping API call`);
+        await markSupplierOrderPlaced(supplierOrderId, `DRY-${poNumber}`);
+      } else {
+        // place with supplier
+        const placeFn = SUPPLIER_PLACE_FN[supplier];
+        if (!placeFn) throw new Error(`No placeOrder function for supplier: ${supplier}`);
+
+        const result = await placeFn({
+          poNumber,
+          items,
+          shippingAddress: mappedAddress,
+        });
+
+        await markSupplierOrderPlaced(supplierOrderId, result.externalOrderId, result.quoteId);
+        console.log(`  ${tag} — placed (PO: ${poNumber}, ext: ${result.externalOrderId})`);
+      }
+
+      // mark all lines as ordered
+      for (const l of lines) {
+        await markLineOrdered(l.id, poNumber);
+      }
+    } catch (err) {
+      console.error(`  ${tag} — FAILED: ${err.message}`);
+      const retry = isTransientError(err);
+      for (const l of lines) {
+        await markLineFailed(l.id, `order placement failed: ${err.message}`, retry);
+      }
+      // mark the supplier_order as failed so it doesn't block future attempts
+      try {
+        const existingSo = await existingSupplierOrder(orderId, supplier);
+        if (existingSo) await markSupplierOrderFailed(existingSo.id, err.message);
+      } catch (_) {}
+      try {
+        await alertOrderPlacementFailed(orderId, supplier, lines, err);
+      } catch (alertErr) {
+        console.error(`  [alert] Failed to send placement alert: ${alertErr.message}`);
+      }
+    }
+  }
+}
+
+// ── Tracking Poll ───────────────────────────────────────
+
+const SUPPLIER_TRACKING_FN = {
+  turn14: turn14.getTracking,
+  meyer: meyer.getTracking,
+};
+
+async function pollTracking() {
+  try {
+    const orders = await getOrdersAwaitingTracking();
+    if (orders.length === 0) return;
+
+    console.log(`[tracking] Checking ${orders.length} order(s) for tracking updates`);
+
+    // eKeystone: batch lookup via date-range query
+    let ekTrackingMap = null;
+
+    for (const so of orders) {
+      try {
+        let trackingInfo = null;
+
+        if (so.supplier === "ekeystone") {
+          // lazy-load eKeystone bulk tracking once per poll
+          if (!ekTrackingMap) {
+            const bulk = await ekeystone.getTrackingBulk();
+            ekTrackingMap = new Map(bulk.map((t) => [t.externalOrderId, t]));
+          }
+          trackingInfo = ekTrackingMap.get(so.external_order_id) || null;
+        } else {
+          const fn = SUPPLIER_TRACKING_FN[so.supplier];
+          if (fn) trackingInfo = await fn(so.external_order_id);
+        }
+
+        if (!trackingInfo?.trackingNumber) continue;
+
+        // update all lines linked to this supplier order
+        const soLines = await getLinesForSupplierOrder(so.id);
+        let shippedCount = 0;
+        for (const line of soLines) {
+          if (line.status === "shipped") {
+            shippedCount++;
+            continue;
+          }
+          await updateLineTracking(line.id, {
+            trackingNumber: trackingInfo.trackingNumber,
+            trackingCarrier: trackingInfo.carrier,
+          });
+          shippedCount++;
+        }
+
+        if (shippedCount === soLines.length) {
+          await markSupplierOrderShipped(so.id);
+          console.log(`[tracking] ${so.po_number} fully shipped (${trackingInfo.trackingNumber})`);
+        } else {
+          await markSupplierOrderPartiallyShipped(so.id);
+        }
+      } catch (err) {
+        console.error(`[tracking] Error checking ${so.po_number}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.error("[tracking] Top-level error:", err.message);
+  }
+}
+
+// ── Ordoro Sync-back ────────────────────────────────────
+
+async function syncTrackingToOrdoro() {
+  try {
+    const lines = await getUnSyncedShippedLines();
+    if (lines.length === 0) return;
+
+    // group by order_id to batch Ordoro API calls
+    const byOrder = new Map();
+    for (const line of lines) {
+      if (!byOrder.has(line.order_id)) byOrder.set(line.order_id, []);
+      byOrder.get(line.order_id).push(line);
+    }
+
+    console.log(`[ordoro-sync] Syncing tracking for ${byOrder.size} order(s)`);
+
+    for (const [orderId, orderLines] of byOrder) {
+      // deduplicate tracking numbers
+      const trackingNumbers = [...new Set(orderLines.map((l) => l.tracking_number).filter(Boolean))];
+
+      const syncedTrackingNumbers = new Set();
+
+      for (const trackingNumber of trackingNumbers) {
+        try {
+          const carrier = orderLines.find((l) => l.tracking_number === trackingNumber)?.tracking_carrier || "";
+
+          await withTimeout(
+            axios.post(
+              `https://api.ordoro.com/v3/order/${encodeURIComponent(orderId)}/shipping_info/`,
+              {
+                tracking_number: trackingNumber,
+                carrier_name: carrier,
+                shipping_method: carrier,
+              },
+              { headers: { Authorization: `Basic ${auth}` } }
+            ),
+            ORDORO_API_TIMEOUT,
+            `ordoro sync tracking ${orderId}`
+          );
+
+          console.log(`[ordoro-sync] Pushed tracking ${trackingNumber} to order #${orderId}`);
+          syncedTrackingNumbers.add(trackingNumber);
+        } catch (err) {
+          // 409/duplicate is fine — tracking already exists in Ordoro
+          if (err.response?.status === 409 || err.response?.status === 400) {
+            console.log(`[ordoro-sync] Tracking ${trackingNumber} already on order #${orderId}`);
+            syncedTrackingNumbers.add(trackingNumber);
+          } else {
+            console.error(`[ordoro-sync] Failed for order #${orderId}: ${err.message}`);
+            continue;
+          }
+        }
+      }
+
+      // only mark lines whose tracking was successfully pushed (or already existed)
+      for (const line of orderLines) {
+        if (syncedTrackingNumbers.has(line.tracking_number)) {
+          await markTrackingSyncedToOrdoro(line.id);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[ordoro-sync] Top-level error:", err.message);
   }
 }
 
@@ -339,8 +640,16 @@ async function syncMeyer() {
 // ── Startup ─────────────────────────────────────────────
 
 async function main() {
-  console.log("=== OMS Simulation Mode ===");
-  console.log("Orders will be evaluated but NOT placed with suppliers.\n");
+  const orderPlacement = process.env.ORDER_PLACEMENT_ENABLED === "true";
+  const dryRun = process.env.DRY_RUN === "true";
+
+  console.log("=== OMS ===");
+  if (orderPlacement) {
+    console.log(`Order placement: ENABLED${dryRun ? " (DRY RUN)" : ""}`);
+  } else {
+    console.log("Order placement: DISABLED (evaluation only)");
+  }
+  console.log();
 
   // startup recovery — reset lines stuck in 'ordering' from a prior crash
   try {
@@ -355,24 +664,37 @@ async function main() {
     console.error("[recovery] Error checking stuck lines:", err.message);
   }
 
-  // // TEMP: skipping feed syncs for testing — polling only
-  // if (process.env.EKEYSTONE_FTP_HOST) {
-  //   await syncEkeystone();
-  //   setInterval(syncEkeystone, EKEYSTONE_SYNC_INTERVAL);
-  // } else {
-  //   console.log("[ekeystone] FTP not configured — skipping feed sync");
-  // }
-  // if (process.env.MEYER_SFTP_HOST) {
-  //   await syncMeyer();
-  //   setInterval(syncMeyer, MEYER_SYNC_INTERVAL);
-  // } else {
-  //   console.log("[meyer] SFTP not configured — skipping feed sync");
-  // }
-  console.log("[startup] Feed syncs disabled for testing — polling only");
+  // Feed syncs
+  if (process.env.EKEYSTONE_FTP_HOST) {
+    await syncEkeystone();
+    setInterval(syncEkeystone, EKEYSTONE_SYNC_INTERVAL);
+  } else {
+    console.log("[ekeystone] FTP not configured — skipping feed sync");
+  }
+  if (process.env.MEYER_SFTP_HOST) {
+    await syncMeyer();
+    setInterval(syncMeyer, MEYER_SYNC_INTERVAL);
+  } else {
+    console.log("[meyer] SFTP not configured — skipping feed sync");
+  }
 
-  // first poll immediately, then every 3 minutes
+  // Poll cycle: fetch orders + decide + place
   await pollCycle();
   setInterval(pollCycle, POLL_INTERVAL);
+
+  // Tracking poll: check suppliers for shipping updates (staggered 1 min)
+  if (orderPlacement) {
+    setTimeout(async () => {
+      await pollTracking();
+      setInterval(pollTracking, TRACKING_POLL_INTERVAL);
+    }, 60_000);
+
+    // Ordoro sync-back: push tracking numbers (staggered 2 min)
+    setTimeout(async () => {
+      await syncTrackingToOrdoro();
+      setInterval(syncTrackingToOrdoro, ORDORO_SYNC_INTERVAL);
+    }, 120_000);
+  }
 }
 
 main();

@@ -143,3 +143,162 @@ export function isFeedSynced() {
 export async function liveCheck(vcpn) {
   return { status: "no_api" };
 }
+
+// ── SOAP Helpers ───────────────────────────────────────
+
+import axios from "axios";
+import { XMLParser, XMLBuilder } from "fast-xml-parser";
+
+const SOAP_ENDPOINT =
+  "https://order.ekeystone.com/WSElectronicOrder/ElectronicOrder.asmx";
+const SOAP_NS = "http://eKeystone.com";
+const EKEYSTONE_SOAP_TIMEOUT = 30_000;
+
+function buildSoapEnvelope(method, params) {
+  const body = {};
+  body[method] = { "@_xmlns": SOAP_NS, ...params };
+  const builder = new XMLBuilder({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@_",
+    format: true,
+  });
+  const innerXml = builder.build(body);
+  return [
+    '<?xml version="1.0" encoding="utf-8"?>',
+    '<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
+    '  xmlns:xsd="http://www.w3.org/2001/XMLSchema"',
+    '  xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">',
+    "  <soap12:Body>",
+    innerXml,
+    "  </soap12:Body>",
+    "</soap12:Envelope>",
+  ].join("\n");
+}
+
+async function callSoap(method, params) {
+  const envelope = buildSoapEnvelope(method, params);
+  const res = await withTimeout(
+    axios.post(SOAP_ENDPOINT, envelope, {
+      headers: {
+        "Content-Type": "application/soap+xml; charset=utf-8",
+      },
+    }),
+    EKEYSTONE_SOAP_TIMEOUT,
+    `ekeystone SOAP ${method}`
+  );
+  const parser = new XMLParser({ ignoreAttributes: false, removeNSPrefix: true });
+  const parsed = parser.parse(res.data);
+  const body = parsed?.Envelope?.Body;
+  return body?.[`${method}Response`]?.[`${method}Result`] || body;
+}
+
+// ── Order Placement ────────────────────────────────────
+
+export async function placeOrder({ poNumber, items, shippingAddress }) {
+  const apiKey =
+    process.env.EKEYSTONE_DROPSHIP_KEY || process.env.EKEYSTONE_API_KEY;
+  const accountNo = process.env.EKEYSTONE_ACCOUNT_NO;
+  if (!apiKey || !accountNo) {
+    throw new Error("eKeystone SOAP credentials not configured (EKEYSTONE_API_KEY / EKEYSTONE_ACCOUNT_NO)");
+  }
+
+  const partList = items
+    .map((i) => `${i.supplierId},${i.quantity}`)
+    .join("|");
+
+  const processMethod =
+    process.env.DRY_RUN === "true" ? "0" : "1";
+
+  const result = await callSoap("ShipOrderDropShipMultipleParts", {
+    Key: apiKey,
+    FullAccountNo: accountNo,
+    PONumber: poNumber,
+    PartList: partList,
+    OrderProcessMethod: processMethod,
+    ShipToName: shippingAddress.ShipToName,
+    ShipToAddress1: shippingAddress.ShipToAddress1,
+    ShipToAddress2: shippingAddress.ShipToAddress2 || "",
+    ShipToCity: shippingAddress.ShipToCity,
+    ShipToState: shippingAddress.ShipToState,
+    ShipToZip: shippingAddress.ShipToZip,
+    ShipToCountry: shippingAddress.ShipToCountry || "US",
+  });
+
+  const status =
+    result?.Status?.OrderStatus ||
+    result?.OrderStatus ||
+    (typeof result === "string" ? result : null);
+
+  if (status === "Error" || status === "error") {
+    const errDetail = JSON.stringify(result?.PartResults || result);
+    throw new Error(`eKeystone order rejected: ${errDetail}`);
+  }
+
+  const externalOrderId =
+    result?.OrderNumber || result?.Status?.OrderNumber || poNumber;
+
+  return { externalOrderId: String(externalOrderId) };
+}
+
+// ── Tracking ───────────────────────────────────────────
+
+export async function getTracking(externalOrderId) {
+  const apiKey =
+    process.env.EKEYSTONE_DROPSHIP_KEY || process.env.EKEYSTONE_API_KEY;
+  const accountNo = process.env.EKEYSTONE_ACCOUNT_NO;
+  if (!apiKey || !accountNo) return null;
+
+  const now = new Date();
+  const dateTo = now.toISOString().slice(0, 10).replace(/-/g, "");
+  const from = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const dateFrom = from.toISOString().slice(0, 10).replace(/-/g, "");
+
+  const result = await callSoap("GetOrderHistory", {
+    Key: apiKey,
+    FullAccountNo: accountNo,
+    StartDate: dateFrom,
+    EndDate: dateTo,
+  });
+
+  const orders = Array.isArray(result?.Order) ? result.Order : result?.Order ? [result.Order] : [];
+
+  for (const order of orders) {
+    const ordNum = order.EKORD || order["EKORD#"];
+    if (String(ordNum) === String(externalOrderId)) {
+      return {
+        trackingNumber: order.EKTRCK || null,
+        carrier: order.EKSVIA || null,
+        status: order.EKSTAT || null,
+      };
+    }
+  }
+
+  return null;
+}
+
+export async function getTrackingBulk() {
+  const apiKey =
+    process.env.EKEYSTONE_DROPSHIP_KEY || process.env.EKEYSTONE_API_KEY;
+  const accountNo = process.env.EKEYSTONE_ACCOUNT_NO;
+  if (!apiKey || !accountNo) return [];
+
+  const now = new Date();
+  const dateTo = now.toISOString().slice(0, 10).replace(/-/g, "");
+  const from = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const dateFrom = from.toISOString().slice(0, 10).replace(/-/g, "");
+
+  const result = await callSoap("GetOrderHistory", {
+    Key: apiKey,
+    FullAccountNo: accountNo,
+    StartDate: dateFrom,
+    EndDate: dateTo,
+  });
+
+  const orders = Array.isArray(result?.Order) ? result.Order : result?.Order ? [result.Order] : [];
+  return orders.map((o) => ({
+    externalOrderId: String(o.EKORD || o["EKORD#"] || ""),
+    trackingNumber: o.EKTRCK || null,
+    carrier: o.EKSVIA || null,
+    status: o.EKSTAT || null,
+  }));
+}

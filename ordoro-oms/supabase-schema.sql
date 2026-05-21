@@ -44,9 +44,21 @@ create table if not exists order_lines (
 
   -- state machine ('manual' = warehouse part, skip supplier matching)
   status           text not null default 'pending'
-    check (status in ('pending', 'decided', 'ordering', 'ordered', 'failed', 'manual', 'expanded')),
+    check (status in ('pending', 'decided', 'ordering', 'ordered', 'shipped', 'failed', 'manual', 'expanded')),
   external_order_id text,
   idempotency_key  text,
+
+  -- order placement
+  supplier_product_id text,       -- Turn14 product_id / eKeystone VCPN / Meyer SKU
+  supplier_order_id   bigint,     -- FK to supplier_orders (added after table exists)
+  supplier_po_number  text,
+  ordered_at          timestamptz,
+
+  -- tracking
+  tracking_number     text,
+  tracking_carrier    text,
+  shipped_at          timestamptz,
+  tracking_synced_to_ordoro boolean default false,
 
   created_at       timestamptz default now(),
   updated_at       timestamptz default now()
@@ -107,7 +119,36 @@ create table if not exists meyer_inventory (
 
 create index if not exists idx_meyer_mfr_part on meyer_inventory(mfr_part_number);
 
--- 7. sync_state — persisted polling watermark
+-- 7. supplier_orders — one row per PO sent to a supplier
+create table if not exists supplier_orders (
+  id                bigint generated always as identity primary key,
+  order_id          text references orders(id),
+  supplier          text not null,           -- 'turn14' | 'ekeystone' | 'meyer'
+  po_number         text not null unique,
+  external_order_id text,
+  quote_id          text,                    -- Turn14 only
+  status            text not null default 'pending'
+    check (status in ('pending', 'placed', 'partially_shipped', 'shipped', 'failed', 'cancelled')),
+  shipping_address  jsonb,
+  items             jsonb,
+  total_cost        numeric(10,2),
+  error_message     text,
+  placed_at         timestamptz,
+  shipped_at        timestamptz,
+  created_at        timestamptz default now(),
+  updated_at        timestamptz default now()
+);
+
+create index if not exists idx_supplier_orders_order on supplier_orders(order_id);
+create index if not exists idx_supplier_orders_active
+  on supplier_orders(status) where status in ('placed', 'partially_shipped');
+
+-- FK from order_lines to supplier_orders
+alter table order_lines add constraint fk_order_lines_supplier_order
+  foreign key (supplier_order_id) references supplier_orders(id);
+create index if not exists idx_order_lines_supplier_order on order_lines(supplier_order_id);
+
+-- 8. sync_state — persisted polling watermark
 create table if not exists sync_state (
   key        text primary key,
   value      text,
@@ -122,4 +163,16 @@ create table if not exists sync_state (
 -- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
 -- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS kit_parent_sku text;
 -- ALTER TABLE order_lines DROP CONSTRAINT IF EXISTS order_lines_status_check;
--- ALTER TABLE order_lines ADD CONSTRAINT order_lines_status_check CHECK (status IN ('pending', 'decided', 'ordering', 'ordered', 'failed', 'manual', 'expanded'));
+-- ALTER TABLE order_lines ADD CONSTRAINT order_lines_status_check CHECK (status IN ('pending', 'decided', 'ordering', 'ordered', 'shipped', 'failed', 'manual', 'expanded'));
+--
+-- ── Order placement migration ───────────────────────────
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS supplier_product_id text;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS supplier_order_id bigint;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS supplier_po_number text;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS ordered_at timestamptz;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS tracking_number text;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS tracking_carrier text;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS shipped_at timestamptz;
+-- ALTER TABLE order_lines ADD COLUMN IF NOT EXISTS tracking_synced_to_ordoro boolean DEFAULT false;
+-- CREATE TABLE IF NOT EXISTS supplier_orders ( ... ); -- see full definition above
+-- ALTER TABLE order_lines ADD CONSTRAINT fk_order_lines_supplier_order FOREIGN KEY (supplier_order_id) REFERENCES supplier_orders(id);

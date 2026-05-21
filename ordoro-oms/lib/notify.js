@@ -148,3 +148,31 @@ export async function alertUnfulfillable(line, decision) {
 
   await sendAlert(subject, body.join("\n"));
 }
+
+export async function alertOrderPlacementFailed(orderId, supplier, lines, error) {
+  const itemList = lines
+    .map((l) => `  - ${l.sku} (mpn=${l.mpn}) qty=${l.quantity}`)
+    .join("\n");
+
+  const isTransient =
+    error.code === "ECONNRESET" ||
+    error.code === "ETIMEDOUT" ||
+    error.message?.includes("timed out") ||
+    [429, 500, 502, 503, 504].includes(error.response?.status);
+
+  const subject = `OMS Alert: Order Placement Failed — #${orderId} -> ${supplier}`;
+  const body = [
+    `Order:     #${orderId}`,
+    `Supplier:  ${supplier}`,
+    `Error:     ${error.message}`,
+    ``,
+    `Affected items:`,
+    itemList,
+    ``,
+    isTransient
+      ? `This appears transient and will automatically retry.`
+      : `Action required: investigate and resolve manually.`,
+  ].join("\n");
+
+  await sendAlert(subject, body);
+}
