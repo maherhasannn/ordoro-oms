@@ -156,7 +156,7 @@ export async function upsertOrder(order, fetchKitComponents) {
           const comp = flatComponents[c];
           const isInsert = /^I-/i.test(comp.componentSku);
           const compMpn = extractMpnFromSku(comp.componentSku);
-          const compIsDs = isInsert ? false : await isComponentDropShip(compMpn);
+          const compIsDs = isInsert ? false : isManualShipSku(comp.componentSku) ? false : await isComponentDropShip(compMpn);
           const compIsManualShip = isManualShipSku(comp.componentSku);
           const compStatus = compIsDs && !compIsManualShip ? "pending" : "manual";
 
