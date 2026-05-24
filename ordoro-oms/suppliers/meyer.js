@@ -220,78 +220,95 @@ export async function liveCheck(sku) {
 const MEYER_ORDER_TIMEOUT = 30_000;
 
 export async function placeOrder({ poNumber, items, shippingAddress }) {
-  const createOrderUrl = process.env.MEYER_CREATE_ORDER_URL;
-  const vendorId = process.env.MEYER_VENDOR_ID;
   const customerNumber = process.env.MEYER_CUSTOMER_NUMBER;
-  if (!createOrderUrl || !vendorId) {
-    throw new Error("Meyer order placement not configured (MEYER_CREATE_ORDER_URL / MEYER_VENDOR_ID)");
+  const shipMethod = process.env.MEYER_DEFAULT_SHIP_METHOD || "FEDEX GRND";
+  if (!customerNumber) {
+    throw new Error("Meyer order placement not configured (MEYER_CUSTOMER_NUMBER)");
   }
 
   await rateLimit("meyer");
 
+  // CustPO: max 20 chars, must be unique per Meyer API
+  const custPO = poNumber.replace(/-meyer/, "").slice(0, 20);
+
   const payload = {
-    VendorID: Number(vendorId),
-    CustomerNumber: customerNumber,
-    PONumber: poNumber,
+    ShipMethod: shipMethod,
+    CustPO: custPO,
+    CollectedSalesTax: "Yes",
+    ShipToName: shippingAddress.ShipToName || "",
+    ShipToAddress1: shippingAddress.ShipToAddress1 || "",
+    ShipToAddress2: shippingAddress.ShipToAddress2 || "",
+    ShipToCity: shippingAddress.ShipToCity || "",
+    ShipToState: shippingAddress.ShipToState || "",
+    ShipToZipcode: shippingAddress.ShipToZipcode || "",
+    ShipToCountry: shippingAddress.ShipToCountry || "USA",
     Items: items.map((i) => ({
-      VendorSKU: i.supplierId,
+      ItemNumber: i.supplierId,
       Quantity: i.quantity,
     })),
-    ShipToName: shippingAddress.ShipToName,
-    ShipToAddress1: shippingAddress.ShipToAddress1,
-    ShipToAddress2: shippingAddress.ShipToAddress2 || "",
-    ShipToCity: shippingAddress.ShipToCity,
-    ShipToState: shippingAddress.ShipToState,
-    ShipToZip: shippingAddress.ShipToZip,
-    ShipToCountry: shippingAddress.ShipToCountry || "US",
   };
+  if (shippingAddress.ShipToPhone) {
+    payload.ShipToPhone = shippingAddress.ShipToPhone;
+  }
 
   const res = await withTimeout(
-    axios.post(createOrderUrl, payload, { headers: authHeaders() }),
+    axios.post(`${BASE}/CreateOrder`, payload, {
+      headers: authHeaders(),
+      params: { CustomerNumber: customerNumber, Consolidate: 1 },
+    }),
     MEYER_ORDER_TIMEOUT,
     "meyer CreateOrder"
   );
 
   const data = res.data;
-  const externalOrderId =
-    data?.OrderSourceOrderID || data?.OrderNumber || data?.order_id;
-
-  if (!externalOrderId) {
-    const errMsg = data?.ErrorMessage || data?.Message || JSON.stringify(data);
+  const orders = data?.Orders;
+  if (!orders || orders.length === 0) {
+    const errMsg = data?.errorMessage || data?.Message || JSON.stringify(data);
     throw new Error(`Meyer order failed: ${errMsg}`);
   }
 
-  return { externalOrderId: String(externalOrderId) };
+  // Meyer may split into multiple orders across warehouses
+  const orderNumbers = orders.map((o) => o.OrderNumber);
+  return { externalOrderId: orderNumbers.join(",") };
 }
 
 // ── Tracking ───────────────────────────────────────────
 
 export async function getTracking(externalOrderId) {
-  const trackingUrl = process.env.MEYER_TRACKING_URL;
-  if (!trackingUrl) return null;
+  const customerNumber = process.env.MEYER_CUSTOMER_NUMBER;
+  if (!customerNumber) return null;
 
   try {
-    await rateLimit("meyer");
-    const res = await withTimeout(
-      axios.get(trackingUrl, {
-        headers: authHeaders(),
-        params: {
-          OrderSourceOrderID: externalOrderId,
-          CustomerNumber: process.env.MEYER_CUSTOMER_NUMBER,
-        },
-      }),
-      MEYER_API_TIMEOUT,
-      `meyer tracking ${externalOrderId}`
-    );
+    // externalOrderId may be comma-separated if Meyer split the order
+    const orderNumbers = externalOrderId.split(",");
 
-    const data = Array.isArray(res.data) ? res.data[0] : res.data;
-    if (!data || !data.TrackingNumber) return null;
+    for (const orderNum of orderNumbers) {
+      await rateLimit("meyer");
+      const res = await withTimeout(
+        axios.get(`${BASE}/SalesTracking`, {
+          headers: authHeaders(),
+          params: {
+            OrderNumber: orderNum.trim(),
+            CustomerNumber: customerNumber,
+          },
+        }),
+        MEYER_API_TIMEOUT,
+        `meyer tracking ${orderNum}`
+      );
 
-    return {
-      trackingNumber: data.TrackingNumber || null,
-      carrier: data.ShipMethod || data.Carrier || null,
-      status: data.Status || null,
-    };
+      const entries = Array.isArray(res.data) ? res.data : [];
+      for (const entry of entries) {
+        if (entry.TrackingNumber) {
+          return {
+            trackingNumber: entry.TrackingNumber,
+            carrier: entry.ShipMethod || null,
+            status: entry.DeliveryETA || null,
+          };
+        }
+      }
+    }
+
+    return null;
   } catch (err) {
     if (err.response?.status === 404) return null;
     throw err;

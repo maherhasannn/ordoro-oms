@@ -198,49 +198,67 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
   const apiKey =
     process.env.EKEYSTONE_DROPSHIP_KEY || process.env.EKEYSTONE_API_KEY;
   const accountNo = process.env.EKEYSTONE_ACCOUNT_NO;
+  const serviceLevel = process.env.EKEYSTONE_SERVICE_LEVEL || "U01";
   if (!apiKey || !accountNo) {
     throw new Error("eKeystone SOAP credentials not configured (EKEYSTONE_API_KEY / EKEYSTONE_ACCOUNT_NO)");
   }
 
-  const partList = items
+  // VCPN,QTY|VCPN,QTY (no trailing pipe, max 250 parts)
+  const partNumberQuantity = items
     .map((i) => `${i.supplierId},${i.quantity}`)
     .join("|");
 
-  const processMethod =
-    process.env.DRY_RUN === "true" ? "0" : "1";
+  const processMethod = process.env.DRY_RUN === "true" ? 0 : 1;
+
+  // PONumber max 20 chars, must be unique
+  const custPO = poNumber.replace(/-ekeystone/, "").slice(0, 20);
+
+  // eKeystone SDK: '&' in any parameter causes SOAP failure
+  const san = (s) => String(s || "").replace(/&/g, "and");
 
   const result = await callSoap("ShipOrderDropShipMultipleParts", {
     Key: apiKey,
     FullAccountNo: accountNo,
-    PONumber: poNumber,
-    PartList: partList,
     OrderProcessMethod: processMethod,
-    ShipToName: shippingAddress.ShipToName,
-    ShipToAddress1: shippingAddress.ShipToAddress1,
-    ShipToAddress2: shippingAddress.ShipToAddress2 || "",
-    ShipToCity: shippingAddress.ShipToCity,
-    ShipToState: shippingAddress.ShipToState,
-    ShipToZip: shippingAddress.ShipToZip,
-    ShipToCountry: shippingAddress.ShipToCountry || "US",
+    PartNumberQuantity: partNumberQuantity,
+    DropShipFirstName: san(shippingAddress.DropShipFirstName),
+    DropShipMiddleInitial: san(shippingAddress.DropShipMiddleInitial),
+    DropShipLastName: san(shippingAddress.DropShipLastName),
+    DropShipCompany: san(shippingAddress.DropShipCompany),
+    DropShipAddress1: san(shippingAddress.DropShipAddress1),
+    DropShipAddress2: san(shippingAddress.DropShipAddress2),
+    DropShipCity: san(shippingAddress.DropShipCity),
+    DropShipState: san(shippingAddress.DropShipState),
+    DropShipPostalCode: san(shippingAddress.DropShipPostalCode),
+    DropShipPhone: san(shippingAddress.DropShipPhone),
+    DropShipCountry: san(shippingAddress.DropShipCountry),
+    DropShipEmail: san(shippingAddress.DropShipEmail),
+    PONumber: custPO,
+    AdditionalInfo: "",
+    ServiceLevel: serviceLevel,
   });
 
-  const status =
-    result?.Status?.OrderStatus ||
-    result?.OrderStatus ||
-    (typeof result === "string" ? result : null);
+  // Response: DataSet with Status table { Status: "OK: Shipping=...", StatusMessage: "OK" }
+  const shipping =
+    result?.diffgram?.ShippingOptions || result?.ShippingOptions || result || {};
+  const statusTable = shipping?.Status || {};
+  const statusStr =
+    statusTable?.Status || (typeof result === "string" ? result : "");
 
-  if (status === "Error" || status === "error") {
-    const errDetail = JSON.stringify(result?.PartResults || result);
-    throw new Error(`eKeystone order rejected: ${errDetail}`);
+  if (!statusStr || statusStr.startsWith("Error")) {
+    const partResults = shipping?.PartResults || {};
+    throw new Error(
+      `eKeystone order rejected: ${statusStr || "unknown error"} | ${JSON.stringify(partResults)}`
+    );
   }
 
-  const externalOrderId =
-    result?.OrderNumber || result?.Status?.OrderNumber || poNumber;
-
-  return { externalOrderId: String(externalOrderId) };
+  // eKeystone doesn't return an order number — track by PO number
+  return { externalOrderId: custPO };
 }
 
 // ── Tracking ───────────────────────────────────────────
+
+const EKSVIA_CARRIER = { "2": "FedEx", "3": "UPS", "6": "Keystone Truck", "7": "Purolator", "8": "USPS" };
 
 export async function getTracking(externalOrderId) {
   const apiKey =
@@ -248,32 +266,37 @@ export async function getTracking(externalOrderId) {
   const accountNo = process.env.EKEYSTONE_ACCOUNT_NO;
   if (!apiKey || !accountNo) return null;
 
-  const now = new Date();
-  const dateTo = now.toISOString().slice(0, 10).replace(/-/g, "");
-  const from = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const dateFrom = from.toISOString().slice(0, 10).replace(/-/g, "");
+  try {
+    const result = await callSoap("GetOrderHistory", {
+      Key: apiKey,
+      FullAccountNo: accountNo,
+      PONumber: externalOrderId,
+      FromDate: "",
+      ToDate: "",
+    });
 
-  const result = await callSoap("GetOrderHistory", {
-    Key: apiKey,
-    FullAccountNo: accountNo,
-    StartDate: dateFrom,
-    EndDate: dateTo,
-  });
+    const table =
+      result?.diffgram?.OrderHistory?.Table ||
+      result?.diffgram?.NewDataSet?.Table ||
+      result?.Table ||
+      result?.Order;
+    const rows = Array.isArray(table) ? table : table ? [table] : [];
 
-  const orders = Array.isArray(result?.Order) ? result.Order : result?.Order ? [result.Order] : [];
-
-  for (const order of orders) {
-    const ordNum = order.EKORD || order["EKORD#"];
-    if (String(ordNum) === String(externalOrderId)) {
-      return {
-        trackingNumber: order.EKTRCK || null,
-        carrier: order.EKSVIA || null,
-        status: order.EKSTAT || null,
-      };
+    for (const row of rows) {
+      const tracking = row.EKTRCK;
+      if (tracking) {
+        return {
+          trackingNumber: tracking,
+          carrier: EKSVIA_CARRIER[row.EKSVIA] || row.EKSVIA || null,
+          status: row.EKSTAT || null,
+        };
+      }
     }
-  }
 
-  return null;
+    return null;
+  } catch (err) {
+    return null;
+  }
 }
 
 export async function getTrackingBulk() {
@@ -287,18 +310,29 @@ export async function getTrackingBulk() {
   const from = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const dateFrom = from.toISOString().slice(0, 10).replace(/-/g, "");
 
-  const result = await callSoap("GetOrderHistory", {
-    Key: apiKey,
-    FullAccountNo: accountNo,
-    StartDate: dateFrom,
-    EndDate: dateTo,
-  });
+  try {
+    const result = await callSoap("GetOrderHistory", {
+      Key: apiKey,
+      FullAccountNo: accountNo,
+      PONumber: "",
+      FromDate: dateFrom,
+      ToDate: dateTo,
+    });
 
-  const orders = Array.isArray(result?.Order) ? result.Order : result?.Order ? [result.Order] : [];
-  return orders.map((o) => ({
-    externalOrderId: String(o.EKORD || o["EKORD#"] || ""),
-    trackingNumber: o.EKTRCK || null,
-    carrier: o.EKSVIA || null,
-    status: o.EKSTAT || null,
-  }));
+    const table =
+      result?.diffgram?.OrderHistory?.Table ||
+      result?.diffgram?.NewDataSet?.Table ||
+      result?.Table ||
+      result?.Order;
+    const rows = Array.isArray(table) ? table : table ? [table] : [];
+
+    return rows.map((o) => ({
+      externalOrderId: String(o["EKPONB"] || o["EKORD#"] || o.EKORD || ""),
+      trackingNumber: o.EKTRCK || null,
+      carrier: EKSVIA_CARRIER[o.EKSVIA] || o.EKSVIA || null,
+      status: o.EKSTAT || null,
+    }));
+  } catch (err) {
+    return [];
+  }
 }
