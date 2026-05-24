@@ -43,83 +43,78 @@ export async function syncFeed() {
   };
 
   const sftp = new SftpClient();
-  let invContent;
-  let priceContent;
 
   try {
-    await withTimeout(
-      (async () => {
-        console.log(`[meyer] Connecting to SFTP ${host}:${port}...`);
-        await sftp.connect({ host, port, username: user, password: pass });
+    console.log(`[meyer] Connecting to SFTP ${host}:${port}...`);
+    await sftp.connect({ host, port, username: user, password: pass });
+  } catch (err) {
+    console.error(`[meyer] SFTP connect failed: ${err.message}`);
+    throw err;
+  }
 
-        console.log("[meyer] Downloading inventory_feed.csv...");
-        const invBuf = await sftp.get(`${dir}/inventory_feed.csv`);
-        invContent = invBuf.toString("utf-8");
-        console.log(`[meyer] Inventory feed: ${(invContent.length / 1024 / 1024).toFixed(1)} MB`);
+  try {
+    // ── Phase 1: download + parse inventory, then free it ──
+    console.log("[meyer] Downloading inventory_feed.csv...");
+    let invContent = (await sftp.get(`${dir}/inventory_feed.csv`)).toString("utf-8");
+    console.log(`[meyer] Inventory feed: ${(invContent.length / 1024 / 1024).toFixed(1)} MB`);
 
-        console.log("[meyer] Downloading pricing_feed.csv...");
-        const priceBuf = await sftp.get(`${dir}/pricing_feed.csv`);
-        priceContent = priceBuf.toString("utf-8");
-        console.log(`[meyer] Pricing feed: ${(priceContent.length / 1024 / 1024).toFixed(1)} MB`);
+    const invMap = new Map();
+    const invParser = Readable.from(invContent).pipe(parse(CSV_OPTS));
+    invContent = null;
+    for await (const r of invParser) {
+      const sku = r["Item Number"];
+      if (!sku) continue;
+      invMap.set(sku, {
+        stock: Math.floor(Number(r["Available"]) || 0),
+        stocking: r["Stocking"] === "Yes",
+        mfr_part_number: r["MFG Item Number"] || null,
+      });
+    }
+    console.log(`[meyer] Parsed ${invMap.size} inventory SKUs`);
 
-        await sftp.end();
-      })(),
-      MEYER_FEED_TIMEOUT,
-      "meyer SFTP feed download"
-    );
+    // ── Phase 2: download + parse pricing, merge, upsert ───
+    console.log("[meyer] Downloading pricing_feed.csv...");
+    let priceContent = (await sftp.get(`${dir}/pricing_feed.csv`)).toString("utf-8");
+    console.log(`[meyer] Pricing feed: ${(priceContent.length / 1024 / 1024).toFixed(1)} MB`);
+
+    await sftp.end();
+
+    const BATCH = 500;
+    let batch = [];
+    let totalMerged = 0;
+    const priceParser = Readable.from(priceContent).pipe(parse(CSV_OPTS));
+    priceContent = null;
+    for await (const p of priceParser) {
+      const sku = p["Meyer Part"];
+      if (!sku) continue;
+
+      const inv = invMap.get(sku);
+      batch.push({
+        meyer_sku: sku,
+        mfr_part_number: inv?.mfr_part_number || p["MFG Item Number"] || null,
+        product_name: p["Description"] || null,
+        stock: inv ? inv.stock : 0,
+        cost: Number(p["Your Price"]) || 0,
+        list_price: Number(p["Jobber Price"]) || 0,
+      });
+
+      if (batch.length >= BATCH) {
+        await upsertMeyerInventory(batch);
+        totalMerged += batch.length;
+        batch = [];
+      }
+    }
+    if (batch.length > 0) {
+      await upsertMeyerInventory(batch);
+      totalMerged += batch.length;
+    }
+
+    console.log(`[meyer] Feed sync complete — ${totalMerged} items cached (${invMap.size} had inventory data)`);
   } catch (err) {
     console.error(`[meyer] SFTP feed sync failed: ${err.message}`);
     try { await sftp.end(); } catch (_) {}
     throw err;
   }
-
-  // Stream-parse inventory row by row into a Map (never hold full array)
-  const invMap = new Map();
-  const invParser = Readable.from(invContent).pipe(parse(CSV_OPTS));
-  for await (const r of invParser) {
-    const sku = r["Item Number"];
-    if (!sku) continue;
-    invMap.set(sku, {
-      stock: Math.floor(Number(r["Available"]) || 0),
-      stocking: r["Stocking"] === "Yes",
-      mfr_part_number: r["MFG Item Number"] || null,
-    });
-  }
-  invContent = null;
-  console.log(`[meyer] Parsed ${invMap.size} inventory SKUs`);
-
-  // Stream-parse pricing, merge with inventory, upsert in batches
-  const BATCH = 500;
-  let batch = [];
-  let totalMerged = 0;
-  const priceParser = Readable.from(priceContent).pipe(parse(CSV_OPTS));
-  for await (const p of priceParser) {
-    const sku = p["Meyer Part"];
-    if (!sku) continue;
-
-    const inv = invMap.get(sku);
-    batch.push({
-      meyer_sku: sku,
-      mfr_part_number: inv?.mfr_part_number || p["MFG Item Number"] || null,
-      product_name: p["Description"] || null,
-      stock: inv ? inv.stock : 0,
-      cost: Number(p["Your Price"]) || 0,
-      list_price: Number(p["Jobber Price"]) || 0,
-    });
-
-    if (batch.length >= BATCH) {
-      await upsertMeyerInventory(batch);
-      totalMerged += batch.length;
-      batch = [];
-    }
-  }
-  if (batch.length > 0) {
-    await upsertMeyerInventory(batch);
-    totalMerged += batch.length;
-  }
-  priceContent = null;
-
-  console.log(`[meyer] Feed sync complete — ${totalMerged} items cached (${invMap.size} had inventory data)`);
 }
 
 // ── REST API: Item Information (live check) ─────────────
