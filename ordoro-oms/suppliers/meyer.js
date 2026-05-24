@@ -1,6 +1,7 @@
 import axios from "axios";
 import SftpClient from "ssh2-sftp-client";
-import { parse } from "csv-parse/sync";
+import { parse } from "csv-parse";
+import { Readable } from "stream";
 import { upsertMeyerInventory, getMeyerInventory, getMeyerByMpn } from "../db.js";
 import { withTimeout } from "../lib/timeout.js";
 import { rateLimit } from "../lib/rateLimit.js";
@@ -33,6 +34,14 @@ export async function syncFeed() {
     return;
   }
 
+  const CSV_OPTS = {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+    relax_column_count: true,
+    relax_quotes: true,
+  };
+
   const sftp = new SftpClient();
   let invContent;
   let priceContent;
@@ -43,13 +52,11 @@ export async function syncFeed() {
         console.log(`[meyer] Connecting to SFTP ${host}:${port}...`);
         await sftp.connect({ host, port, username: user, password: pass });
 
-        // ── Download inventory feed ──────────────────────────
         console.log("[meyer] Downloading inventory_feed.csv...");
         const invBuf = await sftp.get(`${dir}/inventory_feed.csv`);
         invContent = invBuf.toString("utf-8");
         console.log(`[meyer] Inventory feed: ${(invContent.length / 1024 / 1024).toFixed(1)} MB`);
 
-        // ── Download pricing feed ────────────────────────────
         console.log("[meyer] Downloading pricing_feed.csv...");
         const priceBuf = await sftp.get(`${dir}/pricing_feed.csv`);
         priceContent = priceBuf.toString("utf-8");
@@ -66,19 +73,10 @@ export async function syncFeed() {
     throw err;
   }
 
-  // CSV parsing stays outside timeout (local I/O, fast)
-  const invRows = parse(invContent, {
-    columns: true,
-    skip_empty_lines: true,
-    trim: true,
-    relax_column_count: true,
-    relax_quotes: true,
-  });
-  console.log(`[meyer] Parsed ${invRows.length} inventory rows`);
-
-  // Build inventory map: Item Number → { stock, stocking, mfr_part_number }
+  // Stream-parse inventory row by row into a Map (never hold full array)
   const invMap = new Map();
-  for (const r of invRows) {
+  const invParser = Readable.from(invContent).pipe(parse(CSV_OPTS));
+  for await (const r of invParser) {
     const sku = r["Item Number"];
     if (!sku) continue;
     invMap.set(sku, {
@@ -87,41 +85,41 @@ export async function syncFeed() {
       mfr_part_number: r["MFG Item Number"] || null,
     });
   }
+  invContent = null;
+  console.log(`[meyer] Parsed ${invMap.size} inventory SKUs`);
 
-  const priceRows = parse(priceContent, {
-    columns: true,
-    skip_empty_lines: true,
-    trim: true,
-    relax_column_count: true,
-    relax_quotes: true,
-  });
-  console.log(`[meyer] Parsed ${priceRows.length} pricing rows`);
-
-  // ── Merge inventory + pricing ────────────────────────
-  const merged = [];
-  for (const p of priceRows) {
+  // Stream-parse pricing, merge with inventory, upsert in batches
+  const BATCH = 500;
+  let batch = [];
+  let totalMerged = 0;
+  const priceParser = Readable.from(priceContent).pipe(parse(CSV_OPTS));
+  for await (const p of priceParser) {
     const sku = p["Meyer Part"];
     if (!sku) continue;
 
     const inv = invMap.get(sku);
-    const mfrPart = inv?.mfr_part_number || p["MFG Item Number"] || null;
-
-    merged.push({
+    batch.push({
       meyer_sku: sku,
-      mfr_part_number: mfrPart,
+      mfr_part_number: inv?.mfr_part_number || p["MFG Item Number"] || null,
       product_name: p["Description"] || null,
       stock: inv ? inv.stock : 0,
       cost: Number(p["Your Price"]) || 0,
       list_price: Number(p["Jobber Price"]) || 0,
     });
+
+    if (batch.length >= BATCH) {
+      await upsertMeyerInventory(batch);
+      totalMerged += batch.length;
+      batch = [];
+    }
   }
+  if (batch.length > 0) {
+    await upsertMeyerInventory(batch);
+    totalMerged += batch.length;
+  }
+  priceContent = null;
 
-  console.log(`[meyer] Merged ${merged.length} items (${invMap.size} had inventory data)`);
-
-  // ── Upsert to Supabase ───────────────────────────────
-  console.log(`[meyer] Upserting ${merged.length} items to Supabase...`);
-  await upsertMeyerInventory(merged);
-  console.log(`[meyer] Feed sync complete — ${merged.length} items cached`);
+  console.log(`[meyer] Feed sync complete — ${totalMerged} items cached (${invMap.size} had inventory data)`);
 }
 
 // ── REST API: Item Information (live check) ─────────────
