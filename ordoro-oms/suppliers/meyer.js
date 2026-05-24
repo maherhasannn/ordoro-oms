@@ -1,7 +1,8 @@
 import axios from "axios";
 import SftpClient from "ssh2-sftp-client";
 import { parse } from "csv-parse";
-import { Readable } from "stream";
+import { createReadStream } from "fs";
+import { unlink, stat } from "fs/promises";
 import { upsertMeyerInventory, getMeyerInventory, getMeyerByMpn } from "../db.js";
 import { withTimeout } from "../lib/timeout.js";
 import { rateLimit } from "../lib/rateLimit.js";
@@ -52,16 +53,18 @@ export async function syncFeed() {
     throw err;
   }
 
+  const INV_TMP = "/tmp/meyer_inventory.csv";
+  const PRICE_TMP = "/tmp/meyer_pricing.csv";
+
   try {
-    // ── Phase 1: download + parse inventory, then free it ──
+    // ── Phase 1: download inventory to disk, parse from disk ──
     console.log("[meyer] Downloading inventory_feed.csv...");
-    let invContent = (await sftp.get(`${dir}/inventory_feed.csv`)).toString("utf-8");
-    console.log(`[meyer] Inventory feed: ${(invContent.length / 1024 / 1024).toFixed(1)} MB`);
+    await sftp.fastGet(`${dir}/inventory_feed.csv`, INV_TMP);
+    const invSize = (await stat(INV_TMP)).size;
+    console.log(`[meyer] Inventory feed: ${(invSize / 1024 / 1024).toFixed(1)} MB`);
 
     const invMap = new Map();
-    const invParser = Readable.from(invContent).pipe(parse(CSV_OPTS));
-    invContent = null;
-    for await (const r of invParser) {
+    for await (const r of createReadStream(INV_TMP, "utf-8").pipe(parse(CSV_OPTS))) {
       const sku = r["Item Number"];
       if (!sku) continue;
       invMap.set(sku, {
@@ -70,21 +73,21 @@ export async function syncFeed() {
         mfr_part_number: r["MFG Item Number"] || null,
       });
     }
+    await unlink(INV_TMP);
     console.log(`[meyer] Parsed ${invMap.size} inventory SKUs`);
 
-    // ── Phase 2: download + parse pricing, merge, upsert ───
+    // ── Phase 2: download pricing to disk, merge, upsert ───
     console.log("[meyer] Downloading pricing_feed.csv...");
-    let priceContent = (await sftp.get(`${dir}/pricing_feed.csv`)).toString("utf-8");
-    console.log(`[meyer] Pricing feed: ${(priceContent.length / 1024 / 1024).toFixed(1)} MB`);
+    await sftp.fastGet(`${dir}/pricing_feed.csv`, PRICE_TMP);
+    const priceSize = (await stat(PRICE_TMP)).size;
+    console.log(`[meyer] Pricing feed: ${(priceSize / 1024 / 1024).toFixed(1)} MB`);
 
     await sftp.end();
 
     const BATCH = 500;
     let batch = [];
     let totalMerged = 0;
-    const priceParser = Readable.from(priceContent).pipe(parse(CSV_OPTS));
-    priceContent = null;
-    for await (const p of priceParser) {
+    for await (const p of createReadStream(PRICE_TMP, "utf-8").pipe(parse(CSV_OPTS))) {
       const sku = p["Meyer Part"];
       if (!sku) continue;
 
@@ -108,11 +111,14 @@ export async function syncFeed() {
       await upsertMeyerInventory(batch);
       totalMerged += batch.length;
     }
+    await unlink(PRICE_TMP);
 
     console.log(`[meyer] Feed sync complete — ${totalMerged} items cached (${invMap.size} had inventory data)`);
   } catch (err) {
     console.error(`[meyer] SFTP feed sync failed: ${err.message}`);
     try { await sftp.end(); } catch (_) {}
+    try { await unlink(INV_TMP); } catch (_) {}
+    try { await unlink(PRICE_TMP); } catch (_) {}
     throw err;
   }
 }
