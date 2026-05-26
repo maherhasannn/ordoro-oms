@@ -155,14 +155,17 @@ async function processLine(line) {
   // 1. Look up product_map for supplier-specific IDs (handles MPN mismatches)
   const mapping = await lookupProductMap(line.mpn);
 
-  // 2. Check all 3 suppliers in parallel — prefer mapped ID, fall back to MPN
-  const [t14, ekey, mey] = await Promise.all([
-    checkSupplierByMpn("turn14", turn14.checkByMpn, line.mpn, mapping?.turn14_product_id),
+  // 2. Check enabled suppliers in parallel — prefer mapped ID, fall back to MPN
+  const checks = [
     checkSupplierByMpn("ekeystone", ekeystone.checkByMpn, line.mpn, mapping?.ekeystone_vcpn),
     checkSupplierByMpn("meyer", meyer.checkByMpn, line.mpn, mapping?.meyer_sku),
-  ]);
+  ];
+  if (process.env.TURN14_ENABLED !== "false") {
+    checks.push(checkSupplierByMpn("turn14", turn14.checkByMpn, line.mpn, mapping?.turn14_product_id));
+  }
+  const settled = await Promise.all(checks);
 
-  const results = [t14, ekey, mey].filter(Boolean);
+  const results = settled.filter(Boolean);
 
   if (results.length === 0) {
     // Fix: transient errors — leave as pending so it retries next cycle
@@ -251,6 +254,12 @@ async function processLine(line) {
       decision.supplier_stock = null;
       decision.decision_reason = `all suppliers failed live verification: ${detail}`;
     }
+  } else {
+    // No supplier returned a product ID — cannot place an order
+    decision.chosen_supplier = null;
+    decision.supplier_cost = null;
+    decision.supplier_stock = null;
+    decision.decision_reason = `no supplier has a mapped product ID for MPN ${line.mpn}`;
   }
 
   // 5. Log the final decision
@@ -411,6 +420,11 @@ async function placeOrders() {
         throw new Error("No shipping address found for order");
       }
 
+      if (!shippingAddress.name || !shippingAddress.street1 || !shippingAddress.city || !shippingAddress.state || !shippingAddress.zip) {
+        const missing = ["name", "street1", "city", "state", "zip"].filter((f) => !shippingAddress[f]);
+        throw new Error(`Incomplete shipping address (missing: ${missing.join(", ")})`);
+      }
+
       // generate PO number
       const poNumber = `OMS-${orderId}-${supplier}-${Math.floor(Date.now() / 1000)}`;
 
@@ -467,6 +481,23 @@ async function placeOrders() {
       // mark all lines as ordered
       for (const l of lines) {
         await markLineOrdered(l.id, poNumber);
+      }
+
+      // leave a comment on the Ordoro order
+      try {
+        const skuList = lines.map((l) => `${l.sku} x${l.quantity}`).join(", ");
+        await withTimeout(
+          axios.post(
+            `https://api.ordoro.com/v3/order/${encodeURIComponent(orderId)}/comment/`,
+            { comment: `[OMS] DS order placed with ${supplier} (PO: ${poNumber}) — ${skuList}` },
+            { headers: { Authorization: `Basic ${auth}` } }
+          ),
+          ORDORO_API_TIMEOUT,
+          `ordoro comment ${orderId}`
+        );
+        console.log(`  ${tag} — comment posted to Ordoro`);
+      } catch (commentErr) {
+        console.error(`  ${tag} — failed to post Ordoro comment: ${commentErr.message}`);
       }
     } catch (err) {
       console.error(`  ${tag} — FAILED: ${err.message}`);

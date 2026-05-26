@@ -159,28 +159,39 @@ async function apiPost(path, body, retried = false) {
 export async function placeOrder({ poNumber, items, shippingAddress }) {
   await rateLimit("turn14");
 
+  const env = process.env.DRY_RUN === "true" ? "testing" : "production";
+
   // Step 1: create a quote
   const quotePayload = {
-    po_number: poNumber,
-    shipping_address: shippingAddress,
-    line_items: items.map((i) => ({
-      item_identifier: i.supplierId,
-      quantity: i.quantity,
-    })),
-    prop_65_acknowledge: true,
+    data: {
+      environment: env,
+      po_number: poNumber,
+      locations: [
+        {
+          location: "default",
+          combine_in_out_stock: false,
+          items: items.map((i) => ({
+            item_identifier: i.supplierId,
+            item_identifier_type: "item_id",
+            quantity: i.quantity,
+          })),
+        },
+      ],
+      recipient: shippingAddress,
+    },
   };
 
   const quoteRes = await apiPost("/quote", quotePayload);
-  const quoteId = quoteRes?.data?.id || quoteRes?.quote_id;
+  const quoteId = quoteRes?.data?.id;
   if (!quoteId) {
-    throw new Error(`Turn14 quote response missing quote_id: ${JSON.stringify(quoteRes)}`);
+    throw new Error(`Turn14 quote response missing id: ${JSON.stringify(quoteRes)}`);
   }
 
-  // Pick the first (cheapest) shipping option from the first segment
-  const segments = quoteRes?.data?.attributes?.segments || quoteRes?.segments || [];
+  // Pick the first shipping option from the first segment
+  const segments = quoteRes?.data?.attributes?.segments || [];
   let shippingId = null;
   for (const seg of segments) {
-    const options = seg.shipping_options || seg.shipping_methods || [];
+    const options = seg.shipping_quotes || seg.shipping_options || [];
     if (options.length > 0) {
       shippingId = options[0].id || options[0].shipping_id;
       break;
@@ -191,16 +202,19 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
 
   // Step 2: place order from quote
   const orderPayload = {
-    quote_id: quoteId,
-    po_number: poNumber,
-    shipping_id: shippingId,
-    prop_65_acknowledge: true,
-    epa_acknowledge: true,
+    data: {
+      environment: env,
+      quote_id: quoteId,
+      po_number: poNumber,
+      acknowledge_prop_65: true,
+      acknowledge_epa: true,
+      acknowledge_carb: true,
+      shipping: shippingId ? [{ shipping_id: shippingId }] : [],
+    },
   };
 
   const orderRes = await apiPost("/order/from_quote", orderPayload);
-  const externalOrderId =
-    orderRes?.data?.id || orderRes?.order_id || orderRes?.data?.attributes?.order_id;
+  const externalOrderId = orderRes?.data?.id;
 
   return {
     externalOrderId: String(externalOrderId || quoteId),

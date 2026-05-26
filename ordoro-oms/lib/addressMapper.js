@@ -6,18 +6,16 @@ function splitName(fullName) {
 }
 
 export function mapAddressForTurn14(addr) {
-  const { first, last } = splitName(addr.name);
   return {
-    recipient_first_name: first,
-    recipient_last_name: last,
-    recipient_company: addr.company || "",
-    recipient_address1: addr.street1 || "",
-    recipient_address2: addr.street2 || "",
-    recipient_city: addr.city || "",
-    recipient_state: addr.state || "",
-    recipient_zip: addr.zip || "",
-    recipient_country: addr.country || "US",
-    recipient_phone: addr.phone || "",
+    name: addr.name || "",
+    address: addr.street1 || "",
+    address_2: addr.street2 || "",
+    city: addr.city || "",
+    state: addr.state || "",
+    zip: addr.zip || "",
+    country: addr.country || "US",
+    phone_number: (addr.phone || "").replace(/\D/g, ""),
+    is_shop_address: false,
   };
 }
 
