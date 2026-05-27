@@ -221,7 +221,7 @@ const MEYER_ORDER_TIMEOUT = 30_000;
 
 export async function placeOrder({ poNumber, items, shippingAddress }) {
   const customerNumber = process.env.MEYER_CUSTOMER_NUMBER;
-  const shipMethod = process.env.MEYER_DEFAULT_SHIP_METHOD || "FEDEX GRND";
+  const shipMethod = process.env.MEYER_DEFAULT_SHIP_METHOD || "MEYER CHOICE";
   if (!customerNumber) {
     throw new Error("Meyer order placement not configured (MEYER_CUSTOMER_NUMBER)");
   }
