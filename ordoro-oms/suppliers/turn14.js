@@ -187,14 +187,14 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
     throw new Error(`Turn14 quote response missing id: ${JSON.stringify(quoteRes)}`);
   }
 
-  // Pick the first shipping option from the first segment
-  const segments = quoteRes?.data?.attributes?.segments || [];
-  let shippingId = null;
-  for (const seg of segments) {
-    const options = seg.shipping_quotes || seg.shipping_options || [];
+  // Pick the cheapest shipping option per shipment (handles split shipments)
+  const shipments = quoteRes?.data?.attributes?.shipment || [];
+  const shippingSelections = [];
+  for (const s of shipments) {
+    const options = Array.isArray(s.shipping) ? s.shipping : [];
     if (options.length > 0) {
-      shippingId = options[0].id || options[0].shipping_id;
-      break;
+      const sorted = [...options].sort((a, b) => a.cost - b.cost);
+      shippingSelections.push({ shipping_id: sorted[0].shipping_quote_id });
     }
   }
 
@@ -209,7 +209,7 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
       acknowledge_prop_65: true,
       acknowledge_epa: true,
       acknowledge_carb: true,
-      shipping: shippingId ? [{ shipping_id: shippingId }] : [],
+      shipping: shippingSelections,
     },
   };
 

@@ -1,3 +1,7 @@
+function stripDiacritics(s) {
+  return s.normalize("NFD").replace(/[̀-ͯ]/g, "");
+}
+
 function splitName(fullName) {
   if (!fullName) return { first: "", last: "" };
   const parts = fullName.trim().split(/\s+/);
@@ -7,10 +11,10 @@ function splitName(fullName) {
 
 export function mapAddressForTurn14(addr) {
   return {
-    name: addr.name || "",
+    name: stripDiacritics(addr.name || ""),
     address: addr.street1 || "",
     address_2: addr.street2 || "",
-    city: addr.city || "",
+    city: stripDiacritics(addr.city || ""),
     state: addr.state || "",
     zip: addr.zip || "",
     country: addr.country || "US",
@@ -55,6 +59,6 @@ export function mapAddressForMeyer(addr) {
     ShipToState: addr.state || "",
     ShipToZipcode: addr.zip || "",
     ShipToCountry: countryMap[country] || country,
-    ShipToPhone: phone.length === 10 || phone.length === 14 ? phone : "",
+    ShipToPhone: phone || "",
   };
 }

@@ -242,14 +242,12 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
     ShipToState: shippingAddress.ShipToState || "",
     ShipToZipcode: shippingAddress.ShipToZipcode || "",
     ShipToCountry: shippingAddress.ShipToCountry || "USA",
+    ShipToPhone: shippingAddress.ShipToPhone || "",
     Items: items.map((i) => ({
       ItemNumber: i.supplierId,
       Quantity: i.quantity,
     })),
   };
-  if (shippingAddress.ShipToPhone) {
-    payload.ShipToPhone = shippingAddress.ShipToPhone;
-  }
 
   const res = await withTimeout(
     axios.post(`${BASE}/CreateOrder`, payload, {

@@ -194,33 +194,81 @@ async function callSoap(method, params) {
 
 // ── Order Placement ────────────────────────────────────
 
+const SERVICE_LEVELS = [
+  "U09", "U01", "U02", "U03", "U04", "U05", "U06", "U07", "U08", "U10",
+  "F01", "F02", "F03", "F04", "F05", "F06", "F07", "F08", "F09", "F10",
+  "K01", "K02", "K03", "K04", "K05",
+  "LTL",
+];
+
+function parseStatus(result) {
+  const ds =
+    result?.diffgram?.NewDataSet ||
+    result?.diffgram?.ShippingOptions ||
+    result?.ShippingOptions ||
+    result || {};
+  const statusTable = ds?.Status || {};
+  const statusStr =
+    statusTable?.Status || (typeof result === "string" ? result : "");
+  const partResults = ds?.PartResults || {};
+  return { statusStr, partResults };
+}
+
+async function findCheapestServiceLevel(apiKey, accountNo, partNumberQuantity, sanitizedAddress) {
+  const verifyBase = {
+    Key: apiKey,
+    FullAccountNo: accountNo,
+    OrderProcessMethod: 0,
+    PartNumberQuantity: partNumberQuantity,
+    ...sanitizedAddress,
+    AdditionalInfo: "",
+  };
+
+  const results = await Promise.allSettled(
+    SERVICE_LEVELS.map(async (sl) => {
+      const result = await callSoap("ShipOrderDropShipMultipleParts", {
+        ...verifyBase,
+        PONumber: `VFY-${sl}-${Date.now()}`.slice(0, 20),
+        ServiceLevel: sl,
+      });
+      const { statusStr } = parseStatus(result);
+      if (!statusStr || statusStr.startsWith("Error")) return null;
+      const costMatch = statusStr.match(/Shipping=([\d.]+)/);
+      const shippingCost = costMatch ? parseFloat(costMatch[1]) : Infinity;
+      return { serviceLevel: sl, shippingCost, status: statusStr };
+    })
+  );
+
+  const valid = results
+    .filter((r) => r.status === "fulfilled" && r.value)
+    .map((r) => r.value)
+    .sort((a, b) => a.shippingCost - b.shippingCost);
+
+  if (valid.length === 0) return null;
+
+  console.log(
+    `[ekeystone] Shipping options: ${valid.map((v) => `${v.serviceLevel}=$${v.shippingCost}`).join(", ")}`
+  );
+  return valid[0];
+}
+
 export async function placeOrder({ poNumber, items, shippingAddress }) {
   const apiKey =
     process.env.EKEYSTONE_DROPSHIP_KEY || process.env.EKEYSTONE_API_KEY;
   const accountNo = process.env.EKEYSTONE_ACCOUNT_NO;
-  const serviceLevel = process.env.EKEYSTONE_SERVICE_LEVEL || "U01";
   if (!apiKey || !accountNo) {
     throw new Error("eKeystone SOAP credentials not configured (EKEYSTONE_API_KEY / EKEYSTONE_ACCOUNT_NO)");
   }
 
-  // VCPN,QTY|VCPN,QTY (no trailing pipe, max 250 parts)
   const partNumberQuantity = items
     .map((i) => `${i.supplierId},${i.quantity}`)
     .join("|");
 
   const processMethod = process.env.DRY_RUN === "true" ? 0 : 1;
-
-  // PONumber max 20 chars, must be unique
   const custPO = poNumber.replace(/-ekeystone/, "").slice(0, 20);
-
-  // eKeystone SDK: '&' in any parameter causes SOAP failure
   const san = (s) => String(s || "").replace(/&/g, "and");
 
-  const result = await callSoap("ShipOrderDropShipMultipleParts", {
-    Key: apiKey,
-    FullAccountNo: accountNo,
-    OrderProcessMethod: processMethod,
-    PartNumberQuantity: partNumberQuantity,
+  const sanitizedAddress = {
     DropShipFirstName: san(shippingAddress.DropShipFirstName),
     DropShipMiddleInitial: san(shippingAddress.DropShipMiddleInitial),
     DropShipLastName: san(shippingAddress.DropShipLastName),
@@ -233,27 +281,43 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
     DropShipPhone: san(shippingAddress.DropShipPhone),
     DropShipCountry: san(shippingAddress.DropShipCountry),
     DropShipEmail: san(shippingAddress.DropShipEmail),
+  };
+
+  const cheapest = await findCheapestServiceLevel(
+    apiKey, accountNo, partNumberQuantity, sanitizedAddress
+  );
+  if (!cheapest) {
+    throw new Error("eKeystone: no valid shipping service level found for this order");
+  }
+
+  console.log(
+    `[ekeystone] Selected ${cheapest.serviceLevel} ($${cheapest.shippingCost}) for PO ${custPO}`
+  );
+
+  const result = await callSoap("ShipOrderDropShipMultipleParts", {
+    Key: apiKey,
+    FullAccountNo: accountNo,
+    OrderProcessMethod: processMethod,
+    PartNumberQuantity: partNumberQuantity,
+    ...sanitizedAddress,
     PONumber: custPO,
     AdditionalInfo: "",
-    ServiceLevel: serviceLevel,
+    ServiceLevel: cheapest.serviceLevel,
   });
 
-  // Response: DataSet with Status table { Status: "OK: Shipping=...", StatusMessage: "OK" }
-  const shipping =
-    result?.diffgram?.ShippingOptions || result?.ShippingOptions || result || {};
-  const statusTable = shipping?.Status || {};
-  const statusStr =
-    statusTable?.Status || (typeof result === "string" ? result : "");
+  const { statusStr, partResults } = parseStatus(result);
 
   if (!statusStr || statusStr.startsWith("Error")) {
-    const partResults = shipping?.PartResults || {};
     throw new Error(
       `eKeystone order rejected: ${statusStr || "unknown error"} | ${JSON.stringify(partResults)}`
     );
   }
 
-  // eKeystone doesn't return an order number — track by PO number
-  return { externalOrderId: custPO };
+  return {
+    externalOrderId: custPO,
+    serviceLevel: cheapest.serviceLevel,
+    shippingCost: cheapest.shippingCost,
+  };
 }
 
 // ── Tracking ───────────────────────────────────────────

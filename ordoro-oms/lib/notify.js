@@ -149,6 +149,48 @@ export async function alertUnfulfillable(line, decision) {
   await sendAlert(subject, body.join("\n"));
 }
 
+export async function alertHighShippingCost(orderId, supplier, poNumber, shippingCost, serviceLevel, lines) {
+  const threshold = Number(process.env.SHIPPING_COST_ALERT_THRESHOLD) || 100;
+  if (shippingCost < threshold) return;
+
+  const itemList = lines
+    .map((l) => `  - ${l.sku} (mpn=${l.mpn}) qty=${l.quantity}`)
+    .join("\n");
+
+  const subject = `OMS Alert: High Shipping Cost — $${shippingCost} on #${orderId} (${supplier})`;
+  const body = [
+    `Order:          #${orderId}`,
+    `Supplier:       ${supplier}`,
+    `PO:             ${poNumber}`,
+    `Service Level:  ${serviceLevel}`,
+    `Shipping Cost:  $${shippingCost}`,
+    `Threshold:      $${threshold}`,
+    ``,
+    `Items:`,
+    itemList,
+    ``,
+    `This was the cheapest available shipping option. Review whether this order's margin justifies the cost.`,
+  ].join("\n");
+
+  await sendAlert(subject, body);
+}
+
+export async function alertFeedSyncFailed(supplier, error) {
+  const subject = `OMS Alert: ${supplier} Inventory Feed Sync Failed`;
+  const body = [
+    `Supplier: ${supplier}`,
+    `Error:    ${error.message || error}`,
+    `Time:     ${new Date().toISOString()}`,
+    ``,
+    `The inventory feed could not be downloaded or parsed. Cached inventory`,
+    `data is now stale and orders may be placed against outdated stock levels.`,
+    ``,
+    `Action: Check ${supplier} FTP/SFTP credentials and connectivity.`,
+  ].join("\n");
+
+  await sendAlert(subject, body);
+}
+
 export async function alertOrderPlacementFailed(orderId, supplier, lines, error) {
   const itemList = lines
     .map((l) => `  - ${l.sku} (mpn=${l.mpn}) qty=${l.quantity}`)

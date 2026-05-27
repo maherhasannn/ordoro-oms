@@ -40,7 +40,7 @@ import * as turn14 from "./suppliers/turn14.js";
 import * as ekeystone from "./suppliers/ekeystone.js";
 import * as meyer from "./suppliers/meyer.js";
 import { selectBestDeal } from "./lib/bestDeal.js";
-import { alertUnfulfillable, alertOrderPlacementFailed } from "./lib/notify.js";
+import { alertUnfulfillable, alertOrderPlacementFailed, alertHighShippingCost, alertFeedSyncFailed } from "./lib/notify.js";
 import {
   mapAddressForTurn14,
   mapAddressForEkeystone,
@@ -476,6 +476,12 @@ async function placeOrders() {
 
         await markSupplierOrderPlaced(supplierOrderId, result.externalOrderId, result.quoteId);
         console.log(`  ${tag} — placed (PO: ${poNumber}, ext: ${result.externalOrderId})`);
+
+        if (result.shippingCost) {
+          try {
+            await alertHighShippingCost(orderId, supplier, poNumber, result.shippingCost, result.serviceLevel, lines);
+          } catch (_) {}
+        }
       }
 
       // mark all lines as ordered
@@ -657,6 +663,7 @@ async function syncEkeystone() {
     await ekeystone.syncFeed();
   } catch (err) {
     console.error("[ekeystone] Feed sync failed:", err.message);
+    try { await alertFeedSyncFailed("eKeystone", err); } catch (_) {}
   }
 }
 
@@ -667,6 +674,7 @@ async function syncMeyer() {
     await meyer.syncFeed();
   } catch (err) {
     console.error("[meyer] Feed sync failed:", err.message);
+    try { await alertFeedSyncFailed("Meyer", err); } catch (_) {}
   }
 }
 
