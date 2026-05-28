@@ -222,12 +222,7 @@ async function callSoap(method, params) {
 
 // ── Order Placement ────────────────────────────────────
 
-const SERVICE_LEVELS = [
-  "U09", "U01", "U02", "U03", "U04", "U05", "U06", "U07", "U08", "U10",
-  "F01", "F02", "F03", "F04", "F05", "F06", "F07", "F08", "F09", "F10",
-  "K01", "K02", "K03", "K04", "K05",
-  "LTL",
-];
+const EKEYSTONE_SERVICE_LEVEL = "U11"; // UPS Ground
 
 function parseStatus(result) {
   const ds =
@@ -240,44 +235,6 @@ function parseStatus(result) {
     statusTable?.Status || (typeof result === "string" ? result : "");
   const partResults = ds?.PartResults || {};
   return { statusStr, partResults };
-}
-
-async function findCheapestServiceLevel(apiKey, accountNo, partNumberQuantity, sanitizedAddress) {
-  const verifyBase = {
-    Key: apiKey,
-    FullAccountNo: accountNo,
-    OrderProcessMethod: 0,
-    PartNumberQuantity: partNumberQuantity,
-    ...sanitizedAddress,
-    AdditionalInfo: "",
-  };
-
-  const results = await Promise.allSettled(
-    SERVICE_LEVELS.map(async (sl) => {
-      const result = await callSoap("ShipOrderDropShipMultipleParts", {
-        ...verifyBase,
-        PONumber: `VFY-${sl}-${Date.now()}`.slice(0, 20),
-        ServiceLevel: sl,
-      });
-      const { statusStr } = parseStatus(result);
-      if (!statusStr || statusStr.startsWith("Error")) return null;
-      const costMatch = statusStr.match(/Shipping=([\d.]+)/);
-      const shippingCost = costMatch ? parseFloat(costMatch[1]) : Infinity;
-      return { serviceLevel: sl, shippingCost, status: statusStr };
-    })
-  );
-
-  const valid = results
-    .filter((r) => r.status === "fulfilled" && r.value)
-    .map((r) => r.value)
-    .sort((a, b) => a.shippingCost - b.shippingCost);
-
-  if (valid.length === 0) return null;
-
-  console.log(
-    `[ekeystone] Shipping options: ${valid.map((v) => `${v.serviceLevel}=$${v.shippingCost}`).join(", ")}`
-  );
-  return valid[0];
 }
 
 export async function placeOrder({ poNumber, items, shippingAddress }) {
@@ -311,16 +268,7 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
     DropShipEmail: san(shippingAddress.DropShipEmail),
   };
 
-  const cheapest = await findCheapestServiceLevel(
-    apiKey, accountNo, partNumberQuantity, sanitizedAddress
-  );
-  if (!cheapest) {
-    throw new Error("eKeystone: no valid shipping service level found for this order");
-  }
-
-  console.log(
-    `[ekeystone] Selected ${cheapest.serviceLevel} ($${cheapest.shippingCost}) for PO ${custPO}`
-  );
+  console.log(`[ekeystone] Using ${EKEYSTONE_SERVICE_LEVEL} (UPS Ground) for PO ${custPO}`);
 
   const result = await callSoap("ShipOrderDropShipMultipleParts", {
     Key: apiKey,
@@ -330,7 +278,7 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
     ...sanitizedAddress,
     PONumber: custPO,
     AdditionalInfo: "",
-    ServiceLevel: cheapest.serviceLevel,
+    ServiceLevel: EKEYSTONE_SERVICE_LEVEL,
   });
 
   const { statusStr, partResults } = parseStatus(result);
@@ -341,10 +289,13 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
     );
   }
 
+  const costMatch = statusStr.match(/Shipping=([\d.]+)/);
+  const shippingCost = costMatch ? parseFloat(costMatch[1]) : null;
+
   return {
     externalOrderId: custPO,
-    serviceLevel: cheapest.serviceLevel,
-    shippingCost: cheapest.shippingCost,
+    serviceLevel: EKEYSTONE_SERVICE_LEVEL,
+    shippingCost,
   };
 }
 
