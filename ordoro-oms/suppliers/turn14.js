@@ -1,7 +1,7 @@
 import axios from "axios";
 import { withTimeout } from "../lib/timeout.js";
 import { rateLimit } from "../lib/rateLimit.js";
-import { getTurn14ById, getTurn14ByMpn } from "../db.js";
+import { getTurn14ById, getTurn14ByMpn, upsertTurn14Inventory } from "../db.js";
 
 const BASE = process.env.TURN14_BASE_URL || "https://api.turn14.com/v1";
 const TURN14_API_TIMEOUT = 10_000;
@@ -220,6 +220,87 @@ export async function placeOrder({ poNumber, items, shippingAddress }) {
     externalOrderId: String(externalOrderId || quoteId),
     quoteId: String(quoteId),
   };
+}
+
+// ── Bulk Inventory Sync ───────────────────────────────
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export async function bulkSync() {
+  console.log("[turn14] Starting bulk inventory sync...");
+  const headers = await authHeaders();
+
+  const probe = await withTimeout(
+    axios.get(`${BASE}/items?page=1&limit=100`, { headers }),
+    TURN14_API_TIMEOUT,
+    "turn14 bulk sync probe"
+  );
+  const totalPages = probe.data.meta?.total_pages || 1;
+  console.log(`[turn14] ${totalPages} pages to fetch`);
+
+  let totalSynced = 0;
+  let authRetries = 0;
+
+  for (let page = 1; page <= totalPages; page++) {
+    try {
+      const hdrs = await authHeaders();
+      const [itemsRes, invRes] = await Promise.all([
+        axios.get(`${BASE}/items?page=${page}&limit=100`, { headers: hdrs }),
+        axios.get(`${BASE}/inventory?page=${page}&limit=100`, { headers: hdrs }),
+      ]);
+
+      const items = itemsRes.data.data || [];
+      const invData = invRes.data.data || [];
+
+      const invMap = {};
+      for (const inv of invData) {
+        const warehouses = inv.attributes?.inventory || {};
+        let total = 0;
+        for (const wh of Object.values(warehouses)) {
+          const val = typeof wh === "object" && wh !== null ? wh.stock : wh;
+          total += Number(val ?? 0);
+        }
+        invMap[inv.id] = total;
+      }
+
+      const rows = items.map((item) => ({
+        product_id: item.id,
+        part_number: item.attributes?.part_number || null,
+        mfr_part_number: item.attributes?.mfr_part_number || null,
+        product_name: item.attributes?.product_name || null,
+        brand: item.attributes?.brand || null,
+        stock: invMap[item.id] ?? 0,
+        cost: null,
+        map_price: null,
+        updated_at: new Date().toISOString(),
+      }));
+
+      if (rows.length > 0) {
+        await upsertTurn14Inventory(rows);
+        totalSynced += rows.length;
+      }
+
+      if (page % 50 === 0 || page === totalPages) {
+        console.log(`[turn14] Page ${page}/${totalPages} — ${totalSynced} items synced`);
+      }
+
+      authRetries = 0;
+      await sleep(500);
+    } catch (err) {
+      if (err.response?.status === 401 && authRetries < 3) {
+        authRetries++;
+        console.log(`[turn14] Token expired during bulk sync, refreshing (attempt ${authRetries}/3)...`);
+        await getToken(true);
+        page--;
+        continue;
+      }
+      authRetries = 0;
+      console.error(`[turn14] Page ${page} error: ${err.message}`);
+      await sleep(2000);
+    }
+  }
+
+  console.log(`[turn14] Bulk sync complete — ${totalSynced} items`);
 }
 
 // ── Tracking ───────────────────────────────────────────

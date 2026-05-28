@@ -11,6 +11,7 @@ import axios from "axios";
 import { createClient } from "@supabase/supabase-js";
 import * as ekeystone from "./suppliers/ekeystone.js";
 import * as meyer from "./suppliers/meyer.js";
+import { buildProductMap } from "./db.js";
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -145,93 +146,6 @@ async function syncMeyer() {
   }
   console.log("[meyer] Starting SFTP feed sync...");
   await meyer.syncFeed();
-}
-
-// ── Build Product Map ────────────────────────────────────
-// Cross-references all three supplier inventory tables by mfr_part_number
-// to build a unified mapping of MPN → supplier-specific IDs.
-
-async function fetchAllRows(table, columns) {
-  const allRows = [];
-  const PAGE = 1000;
-  let offset = 0;
-  while (true) {
-    const { data, error } = await supabase
-      .from(table)
-      .select(columns)
-      .not("mfr_part_number", "is", null)
-      .range(offset, offset + PAGE - 1);
-    if (error) throw error;
-    allRows.push(...data);
-    if (data.length < PAGE) break;
-    offset += PAGE;
-  }
-  return allRows;
-}
-
-async function buildProductMap() {
-  console.log("[product_map] Building from synced inventory...");
-
-  const [t14Rows, ekeyRows, meyRows] = await Promise.all([
-    fetchAllRows("turn14_inventory", "product_id, mfr_part_number, stock"),
-    fetchAllRows("ekeystone_inventory", "vcpn, mfr_part_number, stock"),
-    fetchAllRows("meyer_inventory", "meyer_sku, mfr_part_number, stock"),
-  ]);
-
-  console.log(
-    `[product_map] Source rows — Turn14: ${t14Rows.length}, eKeystone: ${ekeyRows.length}, Meyer: ${meyRows.length}`
-  );
-
-  const map = new Map();
-
-  for (const r of t14Rows) {
-    const entry = map.get(r.mfr_part_number) || { mpn: r.mfr_part_number };
-    // if duplicate MPN within Turn14, keep the row with highest stock
-    if (!entry.turn14_product_id || r.stock > (entry._t14s || 0)) {
-      entry.turn14_product_id = r.product_id;
-      entry._t14s = r.stock;
-    }
-    map.set(r.mfr_part_number, entry);
-  }
-
-  for (const r of ekeyRows) {
-    const entry = map.get(r.mfr_part_number) || { mpn: r.mfr_part_number };
-    if (!entry.ekeystone_vcpn || r.stock > (entry._eks || 0)) {
-      entry.ekeystone_vcpn = r.vcpn;
-      entry._eks = r.stock;
-    }
-    map.set(r.mfr_part_number, entry);
-  }
-
-  for (const r of meyRows) {
-    const entry = map.get(r.mfr_part_number) || { mpn: r.mfr_part_number };
-    if (!entry.meyer_sku || r.stock > (entry._ms || 0)) {
-      entry.meyer_sku = r.meyer_sku;
-      entry._ms = r.stock;
-    }
-    map.set(r.mfr_part_number, entry);
-  }
-
-  // strip internal tracking fields, prepare for upsert
-  const rows = [...map.values()].map((e) => ({
-    mpn: e.mpn,
-    turn14_product_id: e.turn14_product_id || null,
-    ekeystone_vcpn: e.ekeystone_vcpn || null,
-    meyer_sku: e.meyer_sku || null,
-  }));
-
-  console.log(`[product_map] ${rows.length} unique MPNs across all suppliers`);
-
-  const CHUNK = 500;
-  for (let i = 0; i < rows.length; i += CHUNK) {
-    const chunk = rows.slice(i, i + CHUNK);
-    const { error } = await supabase
-      .from("product_map")
-      .upsert(chunk, { onConflict: "mpn" });
-    if (error) throw error;
-  }
-
-  console.log(`[product_map] Upserted ${rows.length} mappings`);
 }
 
 // ── Main ────────────────────────────────────────────────

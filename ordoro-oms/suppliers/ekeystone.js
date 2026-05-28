@@ -1,6 +1,8 @@
 import { Client as FTPClient } from "basic-ftp";
-import { parse } from "csv-parse/sync";
-import { readFileSync } from "fs";
+import { parse } from "csv-parse";
+import { createReadStream, createWriteStream } from "fs";
+import { unlink, stat } from "fs/promises";
+import { createInterface } from "readline";
 import { tmpdir } from "os";
 import { join } from "path";
 import { upsertEkeystoneInventory, getEkeystoneInventory, getEkeystoneByMpn } from "../db.js";
@@ -58,43 +60,69 @@ export async function syncFeed() {
     client.close();
   }
 
-  // strip Excel-style ="..." quoting → plain values, then parse CSV
-  let raw = readFileSync(LOCAL_FILE, "utf-8");
-  raw = raw.replace(/="([^"]*)"/g, "$1");
+  const feedSize = (await stat(LOCAL_FILE)).size;
+  console.log(`[ekeystone] Feed file: ${(feedSize / 1024 / 1024).toFixed(1)} MB`);
 
-  const records = parse(raw, {
+  // Strip Excel-style ="..." quoting line-by-line to a clean file, then stream-parse it.
+  // Line-by-line avoids the chunk-boundary bug where ="..." splits across chunks.
+  const CLEAN_FILE = LOCAL_FILE + ".clean";
+  const rl = createInterface({ input: createReadStream(LOCAL_FILE, "utf-8"), crlfDelay: Infinity });
+  const ws = createWriteStream(CLEAN_FILE, "utf-8");
+  for await (const line of rl) {
+    ws.write(line.replace(/="([^"]*)"/g, "$1") + "\n");
+  }
+  ws.end();
+  await new Promise((resolve, reject) => { ws.on("finish", resolve); ws.on("error", reject); });
+  await unlink(LOCAL_FILE);
+
+  const CSV_OPTS = {
     columns: true,
     skip_empty_lines: true,
     trim: true,
     relax_column_count: true,
-  });
+  };
 
-  if (records.length === 0) {
-    console.warn("[ekeystone] Feed file was empty or unparseable");
-    return;
-  }
+  const BATCH = 500;
+  let batch = [];
+  let total = 0;
+  let sampleLogged = false;
 
-  console.log(
-    "[ekeystone] Sample record columns:",
-    Object.keys(records[0]).join(", ")
-  );
+  for await (const r of createReadStream(CLEAN_FILE, "utf-8").pipe(parse(CSV_OPTS))) {
+    if (!sampleLogged) {
+      console.log("[ekeystone] Sample record columns:", Object.keys(r).join(", "));
+      sampleLogged = true;
+    }
 
-  // map to our schema using actual eKeystone column names
-  // Columns: VCPN, ManufacturerPartNo, Cost, JobberPrice, TotalQty, plus per-warehouse qtys
-  const rows = records
-    .map((r) => ({
-      vcpn: r["VCPN"] || "",
+    const vcpn = r["VCPN"] || "";
+    if (!vcpn) continue;
+
+    batch.push({
+      vcpn,
       mfr_part_number: r["ManufacturerPartNo"] || null,
       stock: parseInt(r["TotalQty"] || "0", 10),
       cost: parseFloat(r["Cost"] || "0"),
       list_price: parseFloat(r["JobberPrice"] || "0"),
-    }))
-    .filter((r) => r.vcpn);
+    });
 
-  // upsert to Supabase
-  await upsertEkeystoneInventory(rows);
+    if (batch.length >= BATCH) {
+      await upsertEkeystoneInventory(batch);
+      total += batch.length;
+      batch = [];
+    }
+  }
+  if (batch.length > 0) {
+    await upsertEkeystoneInventory(batch);
+    total += batch.length;
+  }
+  await unlink(CLEAN_FILE);
+
+  if (total === 0) {
+    console.warn("[ekeystone] Feed file was empty or unparseable");
+    return;
+  }
+
   lastFeedSync = new Date();
-  console.log(`[ekeystone] Feed synced — ${rows.length} parts cached`);
+  console.log(`[ekeystone] Feed synced — ${total} parts cached`);
 }
 
 // ── Check single VCPN ───────────────────────────────────

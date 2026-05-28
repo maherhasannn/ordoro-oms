@@ -15,6 +15,9 @@ import {
   getRetryableFailedLines,
   resetLineForRetry,
   lookupProductMap,
+  buildProductMap,
+  upsertTurn14Inventory,
+  getStalePendingLines,
   isManualShipSku,
   isInstructionSku,
   markLineManualShip,
@@ -56,9 +59,12 @@ function toPST(iso) {
 // ── Config ──────────────────────────────────────────────
 
 const POLL_INTERVAL = 180_000; // 3 minutes
-const MAX_CACHE_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours — reject eKeystone cache older than this
-const EKEYSTONE_SYNC_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours (feed updates daily)
-const MEYER_SYNC_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours (Meyer pushes periodically)
+const MEYER_MAX_CACHE_AGE_MS = 9 * 24 * 60 * 60 * 1000; // 9 days — Meyer updates weekly (Saturdays)
+const EKEYSTONE_MAX_CACHE_AGE_MS = 48 * 60 * 60 * 1000; // 48 hours — eKeystone updates daily
+const EKEYSTONE_SYNC_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours (eKeystone inventory updates daily)
+const MEYER_SYNC_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours (Meyer pushes weekly on Saturdays, daily sync ensures pickup within a day)
+const PRODUCT_MAP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours — rebuild after feeds are fresh
+const TURN14_BULK_SYNC_INTERVAL = 7 * 24 * 60 * 60 * 1000; // 7 days
 const TRACKING_POLL_INTERVAL = 3_600_000; // 60 minutes
 const ORDORO_SYNC_INTERVAL = 300_000; // 5 minutes
 const WATERMARK_KEY = "ordoro_last_sync";
@@ -204,7 +210,8 @@ async function processLine(line) {
           ? Date.now() - new Date(candidate.cachedAt).getTime()
           : Infinity;
 
-        if (cacheAge > MAX_CACHE_AGE_MS) {
+        const maxAge = candidate.supplier === "meyer" ? MEYER_MAX_CACHE_AGE_MS : EKEYSTONE_MAX_CACHE_AGE_MS;
+        if (cacheAge > maxAge) {
           const ageHrs = Math.round(cacheAge / 3_600_000);
           console.log(`  ${tag} -> ${candidate.supplier} cache too stale (${ageHrs}h old), skipping`);
           continue;
@@ -351,6 +358,23 @@ async function pollCycle() {
       }
     } catch (retryErr) {
       console.error("[retry] Error checking retryable lines:", retryErr.message);
+    }
+
+    // Escalate pending lines stuck for 24+ hours
+    try {
+      const stale = await getStalePendingLines();
+      if (stale.length > 0) {
+        console.log(`[escalate] ${stale.length} pending line(s) stuck for 24+ hours — marking failed`);
+        for (const line of stale) {
+          await markLineFailed(line.id, "stuck in pending for 24+ hours — all supplier checks failing", false);
+          await alertUnfulfillable(line, {
+            decision_reason: "stuck in pending — all supplier checks failed repeatedly for 24+ hours",
+            allResults: [],
+          });
+        }
+      }
+    } catch (escalateErr) {
+      console.error("[escalate] Error checking stale pending lines:", escalateErr.message);
     }
 
     // place orders for decided lines
@@ -507,9 +531,8 @@ async function placeOrders() {
       }
     } catch (err) {
       console.error(`  ${tag} — FAILED: ${err.message}`);
-      const retry = isTransientError(err);
       for (const l of lines) {
-        await markLineFailed(l.id, `order placement failed: ${err.message}`, retry);
+        await markLineFailed(l.id, `order placement failed: ${err.message}`, false);
       }
       // mark the supplier_order as failed so it doesn't block future attempts
       try {
@@ -656,6 +679,22 @@ async function syncTrackingToOrdoro() {
   }
 }
 
+// ── Product Map Rebuild ────────────────────────────────
+
+let turn14SyncRunning = false;
+
+async function syncProductMap() {
+  if (turn14SyncRunning) {
+    console.log("[product_map] Skipping — Turn14 bulk sync in progress (will rebuild after it finishes)");
+    return;
+  }
+  try {
+    await buildProductMap();
+  } catch (err) {
+    console.error("[product_map] Rebuild failed:", err.message);
+  }
+}
+
 // ── eKeystone Feed Sync ─────────────────────────────────
 
 async function syncEkeystone() {
@@ -664,6 +703,25 @@ async function syncEkeystone() {
   } catch (err) {
     console.error("[ekeystone] Feed sync failed:", err.message);
     try { await alertFeedSyncFailed("eKeystone", err); } catch (_) {}
+  }
+}
+
+// ── Turn14 Bulk Inventory Sync ─────────────────────────
+
+async function syncTurn14() {
+  if (turn14SyncRunning) {
+    console.log("[turn14] Bulk sync already running — skipping");
+    return;
+  }
+  turn14SyncRunning = true;
+  try {
+    await turn14.bulkSync();
+    await buildProductMap();
+  } catch (err) {
+    console.error("[turn14] Bulk sync failed:", err.message);
+    try { await alertFeedSyncFailed("Turn14", err); } catch (_) {}
+  } finally {
+    turn14SyncRunning = false;
   }
 }
 
@@ -717,6 +775,16 @@ async function main() {
     setInterval(syncMeyer, MEYER_SYNC_INTERVAL);
   } else {
     console.log("[meyer] SFTP not configured — skipping feed sync");
+  }
+
+  // Rebuild product_map after feeds are fresh
+  await syncProductMap();
+  setInterval(syncProductMap, PRODUCT_MAP_INTERVAL);
+
+  // Turn14 bulk sync — runs in background so poll cycle starts immediately
+  if (process.env.TURN14_ENABLED !== "false") {
+    syncTurn14().catch((err) => console.error("[turn14] Initial bulk sync error:", err.message));
+    setInterval(syncTurn14, TURN14_BULK_SYNC_INTERVAL);
   }
 
   // Poll cycle: fetch orders + decide + place

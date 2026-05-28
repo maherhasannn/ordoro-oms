@@ -360,6 +360,71 @@ export async function lookupProductMap(mpn) {
   return data; // null if not found
 }
 
+export async function buildProductMap() {
+  console.log("[product_map] Building from synced inventory (chunked)...");
+
+  const PAGE = 1000;
+  const UPSERT_BATCH = 500;
+
+  async function processSupplier(table, idCol, targetCol) {
+    let offset = 0;
+    let lastMpn = null;
+    let batch = [];
+    let total = 0;
+
+    while (true) {
+      const { data, error } = await supabase
+        .from(table)
+        .select(`${idCol}, mfr_part_number, stock`)
+        .not("mfr_part_number", "is", null)
+        .order("mfr_part_number", { ascending: true })
+        .order("stock", { ascending: false })
+        .range(offset, offset + PAGE - 1);
+      if (error) throw error;
+      if (data.length === 0) break;
+
+      for (const row of data) {
+        if (row.mfr_part_number === lastMpn) continue;
+        lastMpn = row.mfr_part_number;
+
+        batch.push({ mpn: row.mfr_part_number, [targetCol]: row[idCol] });
+        if (batch.length >= UPSERT_BATCH) {
+          const { error: upsertErr } = await supabase
+            .from("product_map")
+            .upsert(batch, { onConflict: "mpn" });
+          if (upsertErr) throw upsertErr;
+          total += batch.length;
+          batch = [];
+        }
+      }
+
+      if (data.length < PAGE) break;
+      offset += PAGE;
+    }
+
+    if (batch.length > 0) {
+      const { error: upsertErr } = await supabase
+        .from("product_map")
+        .upsert(batch, { onConflict: "mpn" });
+      if (upsertErr) throw upsertErr;
+      total += batch.length;
+    }
+
+    return total;
+  }
+
+  const t14 = await processSupplier("turn14_inventory", "product_id", "turn14_product_id");
+  console.log(`[product_map] Turn14: ${t14} MPNs mapped`);
+
+  const ekey = await processSupplier("ekeystone_inventory", "vcpn", "ekeystone_vcpn");
+  console.log(`[product_map] eKeystone: ${ekey} MPNs mapped`);
+
+  const mey = await processSupplier("meyer_inventory", "meyer_sku", "meyer_sku");
+  console.log(`[product_map] Meyer: ${mey} MPNs mapped`);
+
+  console.log(`[product_map] Done — processed ${t14 + ekey + mey} supplier mappings`);
+}
+
 // ── Fulfillment Decision ────────────────────────────────
 
 export async function updateOrderLineDecision(lineId, decision) {
@@ -382,6 +447,19 @@ export async function updateOrderLineDecision(lineId, decision) {
     .update(update)
     .eq("id", lineId);
   if (error) throw error;
+}
+
+// ── Turn14 Inventory Cache ──────────────────────────────
+
+export async function upsertTurn14Inventory(rows) {
+  const CHUNK = 500;
+  for (let i = 0; i < rows.length; i += CHUNK) {
+    const chunk = rows.slice(i, i + CHUNK);
+    const { error } = await supabase
+      .from("turn14_inventory")
+      .upsert(chunk, { onConflict: "product_id" });
+    if (error) throw error;
+  }
 }
 
 // ── eKeystone Inventory Cache ────────────────────────────
@@ -598,6 +676,20 @@ export async function getStuckOrderingLines(olderThanMinutes = 10) {
   return data || [];
 }
 
+// ── Stale Pending Escalation ────────────────────────────
+
+export async function getStalePendingLines(olderThanMs = 24 * 60 * 60 * 1000) {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const { data, error } = await supabase
+    .from("order_lines")
+    .select("*")
+    .eq("status", "pending")
+    .eq("is_ds", true)
+    .lt("updated_at", cutoff);
+  if (error) throw error;
+  return data || [];
+}
+
 // ── Retry: re-evaluate old failed lines ──────────────────
 
 /**
@@ -611,7 +703,7 @@ export async function getRetryableFailedLines(olderThanMs = 4 * 60 * 60 * 1000, 
     .select("*")
     .eq("status", "failed")
     .eq("is_ds", true)
-    .lt("decided_at", cutoff)
+    .lt("updated_at", cutoff)
     .or(`retry_count.lt.${maxRetries},retry_count.is.null`);
   if (error) throw error;
   return data || [];
