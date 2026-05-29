@@ -458,6 +458,14 @@ export async function updateOrderLineDecision(lineId, decision) {
   if (error) throw error;
 }
 
+export async function setLineDecisionReason(lineId, reason) {
+  const { error } = await supabase
+    .from("order_lines")
+    .update({ decision_reason: reason, updated_at: new Date().toISOString() })
+    .eq("id", lineId);
+  if (error) throw error;
+}
+
 // ── Turn14 Inventory Cache ──────────────────────────────
 
 export async function upsertTurn14Inventory(rows) {

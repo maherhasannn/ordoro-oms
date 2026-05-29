@@ -231,20 +231,27 @@ async function processOrderBatch(dsLines) {
   viable.sort((a, b) => a.totalCost - b.totalCost);
 
   if (viable.length === 0) {
-    // Build per-supplier breakdown for the alert
-    const breakdown = {};
-    for (const supplier of supplierNames) {
-      const missing = [];
-      for (const line of actionable) {
-        const results = lineResultsMap.get(line.id);
-        const match = results.find((r) => r.supplier === supplier && r.supplierId && r.cost > 0 && r.stock >= line.quantity);
-        if (!match) missing.push(line);
-      }
-      if (missing.length > 0) breakdown[supplier] = missing;
-    }
+    const alreadyAlerted = actionable.every((l) => l.decision_reason?.startsWith("no single supplier"));
 
-    console.log(`  ${tag} — no single supplier can fulfill all ${actionable.length} line(s)`);
-    await alertSplitOrder(orderId, actionable, lineResultsMap, breakdown);
+    if (!alreadyAlerted) {
+      const breakdown = {};
+      for (const supplier of supplierNames) {
+        const missing = [];
+        for (const line of actionable) {
+          const results = lineResultsMap.get(line.id);
+          const match = results.find((r) => r.supplier === supplier && r.supplierId && r.cost > 0 && r.stock >= line.quantity);
+          if (!match) missing.push(line);
+        }
+        if (missing.length > 0) breakdown[supplier] = missing;
+      }
+
+      console.log(`  ${tag} — no single supplier can fulfill all ${actionable.length} line(s), alerting`);
+      await alertSplitOrder(orderId, actionable, lineResultsMap, breakdown);
+
+      for (const line of actionable) {
+        await markLineFailed(line.id, "no single supplier can fulfill entire order", false);
+      }
+    }
     return;
   }
 
@@ -272,8 +279,14 @@ async function processOrderBatch(dsLines) {
   }
 
   if (!chosen) {
-    console.log(`  ${tag} — all viable suppliers failed live verification`);
-    await alertSplitOrder(orderId, actionable, lineResultsMap, {});
+    const alreadyAlerted = actionable.every((l) => l.decision_reason?.startsWith("no single supplier"));
+    if (!alreadyAlerted) {
+      console.log(`  ${tag} — all viable suppliers failed live verification, alerting`);
+      await alertSplitOrder(orderId, actionable, lineResultsMap, {});
+      for (const line of actionable) {
+        await markLineFailed(line.id, "no single supplier passed live verification", false);
+      }
+    }
     return;
   }
 
