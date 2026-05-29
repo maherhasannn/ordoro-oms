@@ -155,6 +155,7 @@ export async function upsertOrder(order, fetchKitComponents) {
           continue;
         }
 
+        const orderHasDsTag = tags.includes("Contains DS Items");
         let dsCount = 0;
         let warehouseCount = 0;
         const ordoroLineId = l.id != null ? String(l.id) : null;
@@ -164,7 +165,7 @@ export async function upsertOrder(order, fetchKitComponents) {
           const comp = flatComponents[c];
           const isInsert = /^I-/i.test(comp.componentSku);
           const compMpn = extractMpnFromSku(comp.componentSku);
-          const compIsDs = isInsert ? false : isManualShipSku(comp.componentSku) ? false : await isComponentDropShip(compMpn);
+          const compIsDs = !orderHasDsTag ? false : isInsert ? false : isManualShipSku(comp.componentSku) ? false : await isComponentDropShip(compMpn);
           const compIsManualShip = isManualShipSku(comp.componentSku);
           const compStatus = compIsDs && !compIsManualShip ? "pending" : "manual";
 
