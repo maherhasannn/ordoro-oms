@@ -42,8 +42,7 @@ import { withTimeout } from "./lib/timeout.js";
 import * as turn14 from "./suppliers/turn14.js";
 import * as ekeystone from "./suppliers/ekeystone.js";
 import * as meyer from "./suppliers/meyer.js";
-import { selectBestDeal } from "./lib/bestDeal.js";
-import { alertUnfulfillable, alertOrderPlacementFailed, alertHighShippingCost, alertFeedSyncFailed } from "./lib/notify.js";
+import { alertUnfulfillable, alertSplitOrder, alertOrderPlacementFailed, alertHighShippingCost, alertFeedSyncFailed } from "./lib/notify.js";
 import {
   mapAddressForTurn14,
   mapAddressForEkeystone,
@@ -136,156 +135,165 @@ const LIVE_CHECK_FN = {
   ekeystone: ekeystone.liveCheck,
 };
 
-// ── Process a single unprocessed line ───────────────────
+// ── Verify a single line against a supplier ────────────
 
-async function processLine(line) {
-  const tag = `Order #${line.order_id} line ${line.sku || line.mpn} (qty ${line.quantity})`;
+async function verifyLineWithSupplier(line, match, supplier) {
+  const liveCheckFn = LIVE_CHECK_FN[supplier];
+  const liveResult = await liveCheckFn(match.supplierId);
 
-  if (line.status !== "pending") {
-    console.log(`  ${tag} — skipping (status: ${line.status})`);
-    return;
+  if (liveResult.status === "no_api") {
+    if (!match.cost || match.cost <= 0) return null;
+    if (match.stock < line.quantity) return null;
+    const cacheAge = match.cachedAt ? Date.now() - new Date(match.cachedAt).getTime() : Infinity;
+    const maxAge = supplier === "meyer" ? MEYER_MAX_CACHE_AGE_MS : EKEYSTONE_MAX_CACHE_AGE_MS;
+    if (cacheAge > maxAge) return null;
+    return { cost: match.cost, stock: match.stock, supplierId: match.supplierId };
   }
 
-  if (isManualShipSku(line.sku)) {
-    console.log(`  ${tag} — manual shipment required, skipping supplier processing`);
-    await markLineManualShip(line.id);
-    return;
+  if (liveResult.status === "error") return null;
+
+  const liveCost = liveResult.cost || match.cost;
+  if (!liveCost || liveCost <= 0) return null;
+  if (liveResult.stock < line.quantity) return null;
+  return { cost: liveCost, stock: liveResult.stock, supplierId: match.supplierId };
+}
+
+// ── Process all DS lines for one order as a batch ──────
+
+async function processOrderBatch(dsLines) {
+  const orderId = dsLines[0].order_id;
+  const tag = `Order #${orderId}`;
+
+  // Filter out manual/instruction SKUs first
+  const actionable = [];
+  for (const line of dsLines) {
+    if (line.status !== "pending") continue;
+    if (isManualShipSku(line.sku)) {
+      console.log(`  ${tag} line ${line.sku} — manual shipment, skipping`);
+      await markLineManualShip(line.id);
+      continue;
+    }
+    if (isInstructionSku(line.sku)) {
+      console.log(`  ${tag} line ${line.sku} — instruction code, skipping`);
+      await markLineManualShip(line.id);
+      continue;
+    }
+    actionable.push(line);
   }
 
-  if (isInstructionSku(line.sku)) {
-    console.log(`  ${tag} — instruction code (I- prefix), skipping supplier processing`);
-    await markLineManualShip(line.id);
-    return;
+  if (actionable.length === 0) return;
+
+  console.log(`  ${tag} — evaluating ${actionable.length} DS line(s) for single-supplier fulfillment`);
+
+  // 1. Gather supplier results for each line
+  const lineResultsMap = new Map();
+
+  for (const line of actionable) {
+    const mapping = await lookupProductMap(line.mpn);
+    const checks = [
+      checkSupplierByMpn("ekeystone", ekeystone.checkByMpn, line.mpn, mapping?.ekeystone_vcpn),
+      checkSupplierByMpn("meyer", meyer.checkByMpn, line.mpn, mapping?.meyer_sku),
+    ];
+    if (process.env.TURN14_ENABLED !== "false") {
+      checks.push(checkSupplierByMpn("turn14", turn14.checkByMpn, line.mpn, mapping?.turn14_product_id));
+    }
+    const settled = await Promise.all(checks);
+    lineResultsMap.set(line.id, settled.filter(Boolean));
   }
 
-  // 1. Look up product_map for supplier-specific IDs (handles MPN mismatches)
-  const mapping = await lookupProductMap(line.mpn);
+  // 2. Find suppliers that can fulfill ALL lines (have cost + stock + product ID)
+  const supplierNames = ["ekeystone", "meyer"];
+  if (process.env.TURN14_ENABLED !== "false") supplierNames.push("turn14");
 
-  // 2. Check enabled suppliers in parallel — prefer mapped ID, fall back to MPN
-  const checks = [
-    checkSupplierByMpn("ekeystone", ekeystone.checkByMpn, line.mpn, mapping?.ekeystone_vcpn),
-    checkSupplierByMpn("meyer", meyer.checkByMpn, line.mpn, mapping?.meyer_sku),
-  ];
-  if (process.env.TURN14_ENABLED !== "false") {
-    checks.push(checkSupplierByMpn("turn14", turn14.checkByMpn, line.mpn, mapping?.turn14_product_id));
-  }
-  const settled = await Promise.all(checks);
+  const viable = [];
 
-  const results = settled.filter(Boolean);
+  for (const supplier of supplierNames) {
+    let canFulfillAll = true;
+    let totalCost = 0;
+    const matches = [];
 
-  if (results.length === 0) {
-    // Fix: transient errors — leave as pending so it retries next cycle
-    // instead of permanently marking as failed
-    console.log(`  ${tag} — all supplier checks failed (will retry next cycle)`);
-    return;
-  }
-
-  // 3. Pick best deal (cheapest supplier with a known cost — stock is informational)
-  const decision = selectBestDeal(results, line.quantity);
-
-  // 4. Live verification — try to confirm cost/stock via live API
-  // Include any supplier with a supplierId (not filtered by stock).
-  // Sorted by cost so cheapest is tried first.
-  const candidates = results
-    .filter((r) => r.supplierId)
-    .sort((a, b) => (a.cost || Infinity) - (b.cost || Infinity));
-
-  if (candidates.length > 0) {
-    let verified = false;
-    for (const candidate of candidates) {
-      const liveCheckFn = LIVE_CHECK_FN[candidate.supplier];
-      const liveResult = await liveCheckFn(candidate.supplierId);
-
-      if (liveResult.status === "no_api") {
-        // No live API (e.g., eKeystone) — need a cached cost and fresh cache
-        if (!candidate.cost || candidate.cost <= 0) {
-          console.log(`  ${tag} -> ${candidate.supplier} has no live API and no cached cost, skipping`);
-          continue;
-        }
-        if (candidate.stock < line.quantity) {
-          console.log(`  ${tag} -> ${candidate.supplier} insufficient stock (have ${candidate.stock}, need ${line.quantity}), skipping`);
-          continue;
-        }
-        const cacheAge = candidate.cachedAt
-          ? Date.now() - new Date(candidate.cachedAt).getTime()
-          : Infinity;
-
-        const maxAge = candidate.supplier === "meyer" ? MEYER_MAX_CACHE_AGE_MS : EKEYSTONE_MAX_CACHE_AGE_MS;
-        if (cacheAge > maxAge) {
-          const ageHrs = Math.round(cacheAge / 3_600_000);
-          console.log(`  ${tag} -> ${candidate.supplier} cache too stale (${ageHrs}h old), skipping`);
-          continue;
-        }
-
-        console.log(`  ${tag} -> verified ${candidate.supplier} (no live API, cached: stock ${candidate.stock}, cost $${candidate.cost})`);
-        decision.chosen_supplier = candidate.supplier;
-        decision.supplier_cost = candidate.cost;
-        decision.supplier_stock = candidate.stock;
-        decision.supplier_product_id = candidate.supplierId;
-        decision.decision_reason = `cheapest (cached, no live API)`;
-        verified = true;
+    for (const line of actionable) {
+      const results = lineResultsMap.get(line.id);
+      const match = results.find((r) => r.supplier === supplier && r.supplierId && r.cost > 0 && r.stock >= line.quantity);
+      if (!match) {
+        canFulfillAll = false;
         break;
       }
+      totalCost += match.cost * line.quantity;
+      matches.push({ line, match });
+    }
 
-      if (liveResult.status === "error") {
-        console.error(`  [${candidate.supplier}] live check failed: ${liveResult.error}, skipping`);
-        continue;
-      }
+    if (canFulfillAll) {
+      viable.push({ supplier, totalCost, matches });
+    }
+  }
 
-      // status === "ok" — use live data
-      const liveCost = liveResult.cost || candidate.cost;
-      if (!liveCost || liveCost <= 0) {
-        console.log(`  ${tag} -> ${candidate.supplier} live verified but no cost available, skipping`);
-        continue;
+  viable.sort((a, b) => a.totalCost - b.totalCost);
+
+  if (viable.length === 0) {
+    // Build per-supplier breakdown for the alert
+    const breakdown = {};
+    for (const supplier of supplierNames) {
+      const missing = [];
+      for (const line of actionable) {
+        const results = lineResultsMap.get(line.id);
+        const match = results.find((r) => r.supplier === supplier && r.supplierId && r.cost > 0 && r.stock >= line.quantity);
+        if (!match) missing.push(line);
       }
-      if (liveResult.stock < line.quantity) {
-        console.log(`  ${tag} -> ${candidate.supplier} live stock insufficient (have ${liveResult.stock}, need ${line.quantity}), skipping`);
-        continue;
+      if (missing.length > 0) breakdown[supplier] = missing;
+    }
+
+    console.log(`  ${tag} — no single supplier can fulfill all ${actionable.length} line(s)`);
+    await alertSplitOrder(orderId, actionable, lineResultsMap, breakdown);
+    return;
+  }
+
+  // 3. Live-verify all lines with cheapest viable supplier, fall back to next
+  let chosen = null;
+
+  for (const candidate of viable) {
+    let allVerified = true;
+    const verified = [];
+
+    for (const { line, match } of candidate.matches) {
+      const result = await verifyLineWithSupplier(line, match, candidate.supplier);
+      if (!result) {
+        console.log(`  ${tag} line ${line.sku} — ${candidate.supplier} failed live verification`);
+        allVerified = false;
+        break;
       }
-      console.log(`  ${tag} -> live verified ${candidate.supplier} (stock: ${liveResult.stock}, cost: $${liveCost})`);
-      decision.chosen_supplier = candidate.supplier;
-      decision.supplier_cost = liveCost;
-      decision.supplier_stock = liveResult.stock;
-      decision.supplier_product_id = candidate.supplierId;
-      decision.decision_reason = `cheapest (live verified)`;
-      verified = true;
+      verified.push({ line, ...result });
+    }
+
+    if (allVerified) {
+      chosen = { supplier: candidate.supplier, lines: verified };
       break;
     }
-
-    if (!verified) {
-      const detail = candidates
-        .map((r) => `${r.supplier}: cached ${r.stock} in stock`)
-        .join("; ");
-      decision.chosen_supplier = null;
-      decision.supplier_cost = null;
-      decision.supplier_stock = null;
-      decision.decision_reason = `all suppliers failed live verification: ${detail}`;
-    }
-  } else {
-    // No supplier returned a product ID — cannot place an order
-    decision.chosen_supplier = null;
-    decision.supplier_cost = null;
-    decision.supplier_stock = null;
-    decision.decision_reason = `no supplier has a mapped product ID for MPN ${line.mpn}`;
   }
 
-  // 5. Log the final decision
-  if (decision.chosen_supplier) {
-    console.log(
-      `  ${tag} -> ${decision.chosen_supplier} ` +
-        `at $${decision.supplier_cost}/unit (stock: ${decision.supplier_stock}) ` +
-        `[${decision.decision_reason}]`
-    );
-  } else {
-    console.log(`  ${tag} -> ${decision.decision_reason}`);
-    // alert only when the item truly doesn't exist at any supplier
-    await alertUnfulfillable(line, decision);
+  if (!chosen) {
+    console.log(`  ${tag} — all viable suppliers failed live verification`);
+    await alertSplitOrder(orderId, actionable, lineResultsMap, {});
+    return;
   }
 
-  // 6. Persist decision
-  decision.order_id = line.order_id;
-  decision.line_number = line.line_number;
-  await updateOrderLineDecision(line.id, decision);
+  // 4. Persist decisions — all lines assigned to the same supplier
+  const totalCost = chosen.lines.reduce((s, d) => s + d.cost * d.line.quantity, 0);
+  console.log(`  ${tag} -> ${chosen.supplier} for all ${actionable.length} line(s) (total: $${totalCost.toFixed(2)})`);
+
+  for (const { line, cost, stock, supplierId } of chosen.lines) {
+    const decision = {
+      chosen_supplier: chosen.supplier,
+      supplier_cost: cost,
+      supplier_stock: stock,
+      supplier_product_id: supplierId,
+      decision_reason: `single-supplier fulfillment (${chosen.supplier})`,
+      order_id: line.order_id,
+      line_number: line.line_number,
+    };
+    await updateOrderLineDecision(line.id, decision);
+    console.log(`    ${line.sku} (qty ${line.quantity}) -> $${cost}/unit (stock: ${stock})`);
+  }
 }
 
 // ── Main Poll Cycle ─────────────────────────────────────
@@ -338,12 +346,17 @@ async function pollCycle() {
     await setSyncState(WATERMARK_KEY, watermark);
     console.log(`[poll] Watermark: ${toPST(lastSync)} -> ${toPST(watermark)}`);
 
-    // process unprocessed lines (from this batch and any previous)
+    // process unprocessed lines grouped by order (single-supplier constraint)
     const lines = await getUnprocessedLines();
     if (lines.length > 0) {
-      console.log(`[decide] Processing ${lines.length} unprocessed line(s)...`);
+      const byOrder = new Map();
       for (const line of lines) {
-        await processLine(line);
+        if (!byOrder.has(line.order_id)) byOrder.set(line.order_id, []);
+        byOrder.get(line.order_id).push(line);
+      }
+      console.log(`[decide] Processing ${lines.length} unprocessed line(s) across ${byOrder.size} order(s)...`);
+      for (const [, orderLines] of byOrder) {
+        await processOrderBatch(orderLines);
       }
     }
 
@@ -513,22 +526,6 @@ async function placeOrders() {
         await markLineOrdered(l.id, poNumber);
       }
 
-      // leave a comment on the Ordoro order
-      try {
-        const skuList = lines.map((l) => `${l.sku} x${l.quantity}`).join(", ");
-        await withTimeout(
-          axios.post(
-            `https://api.ordoro.com/v3/order/${encodeURIComponent(orderId)}/comment/`,
-            { comment: `[OMS] DS order placed with ${supplier} (PO: ${poNumber}) — ${skuList}` },
-            { headers: { Authorization: `Basic ${auth}` } }
-          ),
-          ORDORO_API_TIMEOUT,
-          `ordoro comment ${orderId}`
-        );
-        console.log(`  ${tag} — comment posted to Ordoro`);
-      } catch (commentErr) {
-        console.error(`  ${tag} — failed to post Ordoro comment: ${commentErr.message}`);
-      }
     } catch (err) {
       console.error(`  ${tag} — FAILED: ${err.message}`);
       for (const l of lines) {

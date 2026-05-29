@@ -149,6 +149,41 @@ export async function alertUnfulfillable(line, decision) {
   await sendAlert(subject, body.join("\n"));
 }
 
+export async function alertSplitOrder(orderId, lines, lineResultsMap, breakdown) {
+  const subject = `OMS Alert: No single supplier can fulfill Order #${orderId}`;
+
+  const body = [
+    `Order:  #${orderId}`,
+    `Lines:  ${lines.length}`,
+    ``,
+    `No single supplier has stock + cost for every item in this order.`,
+    `Manual intervention required — source from one supplier or split manually.`,
+    ``,
+    `Items in order:`,
+  ];
+
+  for (const line of lines) {
+    const results = lineResultsMap.get(line.id) || [];
+    const available = results
+      .filter((r) => r.supplierId && r.cost > 0)
+      .map((r) => `${r.supplier} (${r.stock} @ $${r.cost})`)
+      .join(", ");
+    body.push(`  - ${line.sku} (mpn=${line.mpn}) qty=${line.quantity} — ${available || "no suppliers"}`);
+  }
+
+  if (Object.keys(breakdown).length > 0) {
+    body.push(``, `Per-supplier gaps:`);
+    for (const [supplier, missing] of Object.entries(breakdown)) {
+      const skus = missing.map((l) => l.sku).join(", ");
+      body.push(`  - ${supplier}: missing ${skus}`);
+    }
+  }
+
+  body.push(``, `Action: Manually source this order or adjust inventory.`);
+
+  await sendAlert(subject, body.join("\n"));
+}
+
 export async function alertHighShippingCost(orderId, supplier, poNumber, shippingCost, serviceLevel, lines) {
   const threshold = Number(process.env.SHIPPING_COST_ALERT_THRESHOLD) || 100;
   if (shippingCost < threshold) return;
