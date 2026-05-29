@@ -646,29 +646,35 @@ export async function markLineOrdered(lineId, externalOrderId) {
   if (error) throw error;
 }
 
-/**
- * Mark a line as failed, or optionally reset to pending for retry.
- */
-export async function markLineFailed(lineId, reason, retry = false) {
-  const update = {
-    status: retry ? "pending" : "failed",
-    decision_reason: reason,
-    updated_at: new Date().toISOString(),
-  };
-  if (retry) {
-    // clear previous decision so it can be re-evaluated
-    update.chosen_supplier = null;
-    update.supplier_cost = null;
-    update.supplier_stock = null;
-    update.supplier_product_id = null;
-    update.decided_at = null;
-    update.idempotency_key = null;
-    update.supplier_order_id = null;
-    update.supplier_po_number = null;
-  }
+export async function resetStuckOrderingLine(lineId) {
   const { error } = await supabase
     .from("order_lines")
-    .update(update)
+    .update({
+      status: "pending",
+      chosen_supplier: null,
+      supplier_cost: null,
+      supplier_stock: null,
+      supplier_product_id: null,
+      decision_reason: null,
+      decided_at: null,
+      idempotency_key: null,
+      supplier_order_id: null,
+      supplier_po_number: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", lineId)
+    .eq("status", "ordering");
+  if (error) throw error;
+}
+
+export async function markLineFailed(lineId, reason) {
+  const { error } = await supabase
+    .from("order_lines")
+    .update({
+      status: "failed",
+      decision_reason: reason,
+      updated_at: new Date().toISOString(),
+    })
     .eq("id", lineId);
   if (error) throw error;
 }
@@ -704,49 +710,6 @@ export async function getStalePendingLines(olderThanMs = 24 * 60 * 60 * 1000) {
   return data || [];
 }
 
-// ── Retry: re-evaluate old failed lines ──────────────────
-
-/**
- * Find failed DS lines eligible for automatic retry.
- * Lines must be older than the cooldown period and under the max retry count.
- */
-export async function getRetryableFailedLines(olderThanMs = 4 * 60 * 60 * 1000, maxRetries = 3) {
-  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
-  const { data, error } = await supabase
-    .from("order_lines")
-    .select("*")
-    .eq("status", "failed")
-    .eq("is_ds", true)
-    .lt("updated_at", cutoff)
-    .or(`retry_count.lt.${maxRetries},retry_count.is.null`);
-  if (error) throw error;
-  return data || [];
-}
-
-/**
- * Reset a failed line back to pending for re-evaluation.
- * Uses an optimistic lock on status='failed' to prevent races.
- */
-export async function resetLineForRetry(lineId, currentRetryCount) {
-  const { error } = await supabase
-    .from("order_lines")
-    .update({
-      status: "pending",
-      chosen_supplier: null,
-      supplier_cost: null,
-      supplier_stock: null,
-      supplier_product_id: null,
-      decided_at: null,
-      idempotency_key: null,
-      supplier_order_id: null,
-      supplier_po_number: null,
-      retry_count: (currentRetryCount || 0) + 1,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", lineId)
-    .eq("status", "failed"); // optimistic lock
-  if (error) throw error;
-}
 
 // ── Order Placement ─────────────────────────────────────
 

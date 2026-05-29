@@ -12,8 +12,7 @@ import {
   setSyncState,
   getStuckOrderingLines,
   markLineFailed,
-  getRetryableFailedLines,
-  resetLineForRetry,
+  resetStuckOrderingLine,
   lookupProductMap,
   buildProductMap,
   upsertTurn14Inventory,
@@ -249,7 +248,7 @@ async function processOrderBatch(dsLines) {
       await alertSplitOrder(orderId, actionable, lineResultsMap, breakdown);
 
       for (const line of actionable) {
-        await markLineFailed(line.id, "no single supplier can fulfill entire order", false);
+        await markLineFailed(line.id, "no single supplier can fulfill entire order");
       }
     }
     return;
@@ -284,7 +283,7 @@ async function processOrderBatch(dsLines) {
       console.log(`  ${tag} — all viable suppliers failed live verification, alerting`);
       await alertSplitOrder(orderId, actionable, lineResultsMap, {});
       for (const line of actionable) {
-        await markLineFailed(line.id, "no single supplier passed live verification", false);
+        await markLineFailed(line.id, "no single supplier passed live verification");
       }
     }
     return;
@@ -373,18 +372,6 @@ async function pollCycle() {
       }
     }
 
-    // Fix: periodically retry failed lines (stock may have been restocked)
-    try {
-      const retryable = await getRetryableFailedLines();
-      if (retryable.length > 0) {
-        console.log(`[retry] Resetting ${retryable.length} failed line(s) for re-evaluation`);
-        for (const line of retryable) {
-          await resetLineForRetry(line.id, line.retry_count);
-        }
-      }
-    } catch (retryErr) {
-      console.error("[retry] Error checking retryable lines:", retryErr.message);
-    }
 
     // Escalate pending lines stuck for 24+ hours
     try {
@@ -392,7 +379,7 @@ async function pollCycle() {
       if (stale.length > 0) {
         console.log(`[escalate] ${stale.length} pending line(s) stuck for 24+ hours — marking failed`);
         for (const line of stale) {
-          await markLineFailed(line.id, "stuck in pending for 24+ hours — all supplier checks failing", false);
+          await markLineFailed(line.id, "stuck in pending for 24+ hours — all supplier checks failing");
           await alertUnfulfillable(line, {
             decision_reason: "stuck in pending — all supplier checks failed repeatedly for 24+ hours",
             allResults: [],
@@ -542,7 +529,7 @@ async function placeOrders() {
     } catch (err) {
       console.error(`  ${tag} — FAILED: ${err.message}`);
       for (const l of lines) {
-        await markLineFailed(l.id, `order placement failed: ${err.message}`, false);
+        await markLineFailed(l.id, `order placement failed: ${err.message}`);
       }
       // mark the supplier_order as failed so it doesn't block future attempts
       try {
@@ -766,7 +753,7 @@ async function main() {
     if (stuck.length > 0) {
       console.log(`[recovery] Found ${stuck.length} lines stuck in 'ordering' — resetting to pending`);
       for (const line of stuck) {
-        await markLineFailed(line.id, "reset after process restart", true);
+        await resetStuckOrderingLine(line.id);
       }
     }
   } catch (err) {
