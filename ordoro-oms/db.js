@@ -95,11 +95,8 @@ export async function upsertOrder(order, fetchKitComponents) {
   );
   if (orderErr) throw orderErr;
 
-  // Skip line processing for orders already shipped/delivered — an internal note
-  // edit in Ordoro bumps updated_at, which re-triggers the poll, but we must not
-  // re-expand kits or create new supplier orders for fulfilled orders.
   const ordoroStatus = (order.status || "").toLowerCase();
-  if (ordoroStatus === "shipped" || ordoroStatus === "delivered" || ordoroStatus === "cancelled") {
+  if (ordoroStatus !== "awaiting_fulfillment") {
     return kitExpansions;
   }
 
