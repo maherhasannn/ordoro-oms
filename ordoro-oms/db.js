@@ -264,7 +264,8 @@ export async function upsertOrder(order, fetchKitComponents) {
       ? false
       : l.shippability?.is_dropship === true ||
         lineTags.includes("Drop Ship") ||
-        lineTags.includes("DS");
+        lineTags.includes("DS") ||
+        tags.includes("Contains DS Items");
     const lineIsManualShip = isManualShipSku(sku);
 
     // Fix: use Ordoro's line item ID for stable identity (array index is fragile)
