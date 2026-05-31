@@ -260,13 +260,13 @@ export async function upsertOrder(order, fetchKitComponents) {
     // Ordoro flattens product fields onto the line (product_name, product_tags, shippability)
     const lineTags = (l.product_tags || l.product?.tags || []).map((t) => t.text || t);
     const isInsert = /^I-/i.test(sku);
-    const lineIsDs = isInsert
+    const lineIsManualShip = isManualShipSku(sku);
+    const lineIsDs = isInsert || lineIsManualShip
       ? false
       : l.shippability?.is_dropship === true ||
         lineTags.includes("Drop Ship") ||
         lineTags.includes("DS") ||
         tags.includes("Contains DS Items");
-    const lineIsManualShip = isManualShipSku(sku);
 
     // Fix: use Ordoro's line item ID for stable identity (array index is fragile)
     const ordoroLineId = l.id != null ? String(l.id) : null;
