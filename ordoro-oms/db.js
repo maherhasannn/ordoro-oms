@@ -3,6 +3,7 @@ dotenv.config();
 
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
+import { alertSuspiciousMpn } from "./lib/notify.js";
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -47,16 +48,15 @@ export async function markLineManualShip(lineId) {
 
 // ── Kit Helpers ──────────────────────────────────────────
 
-/**
- * Extract manufacturer part number from a component SKU.
- * Convention: "BRAND-MPN" → strips everything before the first hyphen.
- * e.g. "BIL-24-188241" → "24-188241", "RAN-RS55042" → "RS55042"
- * Falls back to the full SKU if no hyphen is found.
- */
 function extractMpnFromSku(sku) {
   if (!sku) return null;
+  // "BIL33-292625" → brand "BIL" concatenated with MPN "33-292625"
+  const directMatch = sku.match(/^[A-Z]{2,}(\d[\w.-]+)/);
+  if (directMatch) return directMatch[1];
+  // "JCO-836905" → brand "JCO", hyphen separator, MPN "836905"
   const idx = sku.indexOf("-");
-  return idx > 0 ? sku.slice(idx + 1) : sku;
+  if (idx > 0) return sku.slice(idx + 1);
+  return sku;
 }
 
 /**
@@ -64,7 +64,7 @@ function extractMpnFromSku(sku) {
  * Returns true if at least one supplier has a matching record (DS-eligible).
  */
 async function isComponentDropShip(mpn) {
-  if (!mpn) return false;
+  if (!mpn || mpn.length < 2) return false;
   const [t14, ekey, mey] = await Promise.all([
     getTurn14ByMpn(mpn),
     getEkeystoneByMpn(mpn),
@@ -162,6 +162,9 @@ export async function upsertOrder(order, fetchKitComponents) {
           const comp = flatComponents[c];
           const isInsert = /^I-/i.test(comp.componentSku);
           const compMpn = extractMpnFromSku(comp.componentSku);
+          if (compMpn && compMpn.length < 2) {
+            alertSuspiciousMpn(order.order_number, comp.componentSku, compMpn).catch(() => {});
+          }
           const compIsDs = !orderHasDsTag ? false : isInsert ? false : isManualShipSku(comp.componentSku) ? false : await isComponentDropShip(compMpn);
           const compIsManualShip = isManualShipSku(comp.componentSku);
           const compStatus = compIsDs && !compIsManualShip ? "pending" : "manual";

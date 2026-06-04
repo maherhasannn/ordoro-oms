@@ -226,6 +226,24 @@ export async function alertFeedSyncFailed(supplier, error) {
   await sendAlert(subject, body);
 }
 
+export async function alertSuspiciousMpn(orderId, sku, extractedMpn) {
+  const subject = `OMS Alert: Suspicious MPN extracted — "${extractedMpn}" from ${sku} (Order #${orderId})`;
+  const body = [
+    `Order:         #${orderId}`,
+    `Component SKU: ${sku}`,
+    `Extracted MPN: "${extractedMpn}" (${extractedMpn.length} char)`,
+    ``,
+    `The MPN extracted from this kit component SKU is suspiciously short`,
+    `(under 2 characters). It has been marked as manual to prevent a`,
+    `false supplier match.`,
+    ``,
+    `Action: Verify whether this component should be drop-shipped. If so,`,
+    `ensure the SKU follows the BRAND-MPN or BRAND+MPN convention.`,
+  ].join("\n");
+
+  await sendAlert(subject, body);
+}
+
 export async function alertOrderPlacementFailed(orderId, supplier, lines, error) {
   const itemList = lines
     .map((l) => `  - ${l.sku} (mpn=${l.mpn}) qty=${l.quantity}`)
