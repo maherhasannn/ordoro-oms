@@ -634,15 +634,23 @@ async function syncTrackingToOrdoro() {
 
       for (const trackingNumber of trackingNumbers) {
         try {
-          const carrier = orderLines.find((l) => l.tracking_number === trackingNumber)?.tracking_carrier || "";
+          const shippedLine = orderLines.find((l) => l.tracking_number === trackingNumber);
+          const carrier = shippedLine?.tracking_carrier || "";
 
+          // NOTE: no trailing slash — Ordoro routes `/shipping_info/` to a
+          // different handler that rejects this payload with a 400
           await withTimeout(
             axios.post(
-              `https://api.ordoro.com/v3/order/${encodeURIComponent(orderId)}/shipping_info/`,
+              `https://api.ordoro.com/v3/order/${encodeURIComponent(orderId)}/shipping_info`,
               {
                 tracking_number: trackingNumber,
                 carrier_name: carrier,
                 shipping_method: carrier,
+                cost: 0,
+                ship_date: shippedLine?.shipped_at || new Date().toISOString(),
+                notify_bill_to: false,
+                notify_ship_to: false,
+                notify_cart: true,
               },
               { headers: { Authorization: `Basic ${auth}` } }
             ),
@@ -653,12 +661,14 @@ async function syncTrackingToOrdoro() {
           console.log(`[ordoro-sync] Pushed tracking ${trackingNumber} to order #${orderId}`);
           syncedTrackingNumbers.add(trackingNumber);
         } catch (err) {
-          // 409/duplicate is fine — tracking already exists in Ordoro
-          if (err.response?.status === 409 || err.response?.status === 400) {
-            console.log(`[ordoro-sync] Tracking ${trackingNumber} already on order #${orderId}`);
+          // 409 = tracking already exists in Ordoro (one tracking per order) — treat as synced.
+          // 400 is a real validation failure and must NOT be marked synced.
+          if (err.response?.status === 409) {
+            console.log(`[ordoro-sync] Tracking already on order #${orderId} (409)`);
             syncedTrackingNumbers.add(trackingNumber);
           } else {
-            console.error(`[ordoro-sync] Failed for order #${orderId}: ${err.message}`);
+            const body = err.response?.data ? ` | ${JSON.stringify(err.response.data)}` : "";
+            console.error(`[ordoro-sync] Failed for order #${orderId}: ${err.response?.status || ""} ${err.message}${body}`);
             continue;
           }
         }
