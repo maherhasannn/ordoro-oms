@@ -318,28 +318,32 @@ export async function getTracking(externalOrderId) {
       ToDate: "",
     });
 
-    const table =
-      result?.diffgram?.OrderHistory?.Table ||
-      result?.diffgram?.NewDataSet?.Table ||
-      result?.Table ||
-      result?.Order;
-    const rows = Array.isArray(table) ? table : table ? [table] : [];
+    const rows = extractHistoryRows(result);
 
     for (const row of rows) {
-      const tracking = row.EKTRCK;
+      const tracking = String(row.EKTRCK ?? "").trim();
       if (tracking) {
         return {
           trackingNumber: tracking,
-          carrier: EKSVIA_CARRIER[row.EKSVIA] || row.EKSVIA || null,
-          status: row.EKSTAT || null,
+          carrier: EKSVIA_CARRIER[row.EKSVIA] || String(row.EKSVIA ?? "") || null,
+          status: String(row.EKSTAT ?? "").trim() || null,
         };
       }
     }
 
     return null;
   } catch (err) {
+    console.error(`[ekeystone] GetOrderHistory (${externalOrderId}) failed: ${err.message}`);
     return null;
   }
+}
+
+// Rows live under diffgram.NewDataSet.Table1 (confirmed 2026-07-17); older
+// fallbacks kept in case Keystone changes the dataset name again.
+function extractHistoryRows(result) {
+  const ds = result?.diffgram?.NewDataSet || result?.diffgram?.OrderHistory || result;
+  const table = ds?.Table1 || ds?.Table || ds?.Order;
+  return Array.isArray(table) ? table : table ? [table] : [];
 }
 
 export async function getTrackingBulk() {
@@ -362,20 +366,29 @@ export async function getTrackingBulk() {
       ToDate: dateTo,
     });
 
-    const table =
-      result?.diffgram?.OrderHistory?.Table ||
-      result?.diffgram?.NewDataSet?.Table ||
-      result?.Table ||
-      result?.Order;
-    const rows = Array.isArray(table) ? table : table ? [table] : [];
+    const rows = extractHistoryRows(result);
 
-    return rows.map((o) => ({
-      externalOrderId: String(o["EKPONB"] || o["EKORD#"] || o.EKORD || ""),
-      trackingNumber: o.EKTRCK || null,
-      carrier: EKSVIA_CARRIER[o.EKSVIA] || o.EKSVIA || null,
-      status: o.EKSTAT || null,
-    }));
+    // One order returns a row per status step (RCV ORD → ORDER → PICK →
+    // PACKAGE → INVOICE). Only PACKAGE rows carry EKTRCK, so aggregate per PO
+    // and never let a later tracking-less row overwrite a found tracking.
+    const byPo = new Map();
+    for (const o of rows) {
+      // .NET encodes "#" as _x0023_ in element names
+      const po = String(o.EKORD_x0023_ ?? o["EKORD#"] ?? o.EKPONB ?? o.EKORD ?? "").trim();
+      if (!po) continue;
+      const tracking = String(o.EKTRCK ?? "").trim();
+      const existing = byPo.get(po);
+      if (existing?.trackingNumber && !tracking) continue;
+      byPo.set(po, {
+        externalOrderId: po,
+        trackingNumber: tracking || null,
+        carrier: EKSVIA_CARRIER[o.EKSVIA] || String(o.EKSVIA ?? "") || null,
+        status: String(o.EKSTAT ?? "").trim() || null,
+      });
+    }
+    return [...byPo.values()];
   } catch (err) {
+    console.error(`[ekeystone] GetOrderHistory bulk failed: ${err.message}`);
     return [];
   }
 }
