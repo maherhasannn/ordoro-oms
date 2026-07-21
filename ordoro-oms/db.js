@@ -59,11 +59,7 @@ function extractMpnFromSku(sku) {
   return sku;
 }
 
-/**
- * Check if a component MPN exists at any supplier.
- * Returns true if at least one supplier has a matching record (DS-eligible).
- */
-async function isComponentDropShip(mpn) {
+async function existsAtAnySupplier(mpn) {
   if (!mpn || mpn.length < 2) return false;
   const [t14, ekey, mey] = await Promise.all([
     getTurn14ByMpn(mpn),
@@ -71,6 +67,19 @@ async function isComponentDropShip(mpn) {
     getMeyerByMpn(mpn),
   ]);
   return !!(t14 || ekey || mey);
+}
+
+/**
+ * Resolve which identifier the suppliers know a kit component by.
+ * Tries the extracted MPN first, then the full SKU — some brands' part
+ * numbers include the letter prefix (e.g. RS994329), so stripping it
+ * produces an MPN no supplier recognizes.
+ * Returns the matched identifier (DS-eligible), or null if no supplier has it.
+ */
+async function resolveComponentMpn(mpn, sku) {
+  if (await existsAtAnySupplier(mpn)) return mpn;
+  if (sku && sku !== mpn && (await existsAtAnySupplier(sku))) return sku;
+  return null;
 }
 
 // ── Orders ──────────────────────────────────────────────
@@ -161,12 +170,22 @@ export async function upsertOrder(order, fetchKitComponents) {
         for (let c = 0; c < flatComponents.length; c++) {
           const comp = flatComponents[c];
           const isInsert = /^I-/i.test(comp.componentSku);
-          const compMpn = extractMpnFromSku(comp.componentSku);
+          let compMpn = extractMpnFromSku(comp.componentSku);
           if (compMpn && compMpn.length < 2) {
             alertSuspiciousMpn(order.order_number, comp.componentSku, compMpn).catch(() => {});
           }
-          const compIsDs = !orderHasDsTag ? false : isInsert ? false : isManualShipSku(comp.componentSku) ? false : await isComponentDropShip(compMpn);
           const compIsManualShip = isManualShipSku(comp.componentSku);
+          let compIsDs = false;
+          if (orderHasDsTag && !isInsert && !compIsManualShip) {
+            const resolved = await resolveComponentMpn(compMpn, comp.componentSku);
+            if (resolved) {
+              if (resolved !== compMpn) {
+                console.log(`[kit] MPN ${compMpn} not in any feed — suppliers know it as ${resolved}, using full SKU`);
+                compMpn = resolved;
+              }
+              compIsDs = true;
+            }
+          }
           const compStatus = compIsDs && !compIsManualShip ? "pending" : "manual";
 
           if (compStatus === "pending") dsCount++;
